@@ -1,0 +1,59 @@
+# ============
+# EXPERT MODE
+# ============
+
+# --- I/O roots ---
+dmri_root: /path/to/output_root                  # where the pipeline writes everything
+input_root: /path/to/input_root                  # must contain AP/PA (or LR/RL) subfolders with *_ph for phases when present
+# Optional: explicit T1 used for masking (bet4animal) and for DWI→T1 mask transfer
+t1: /path/to/T1.nii.gz
+
+# --- Denoise (NORDIC or your wrapper script) ---
+denoise_sh: /path/to/denoise_wrapper.sh
+
+# --- Gibbs & N4 (Docker images or local tools) ---
+use_docker: true
+gibbs_image: ghcr.io/yourorg/gibbs:latest
+n4_image: ghcr.io/yourorg/ants_n4:latest
+run_gibbs: true
+run_n4: true
+interactive_tty: true
+
+# --- Combination / b0 handling ---
+REMOVE_B0: true          # remove initial b0s before combining
+B0RANGE: 60              # tolerance for b=0 selection (±)
+COMBINE_MATCHED_FLAG: 1  # 1: only combine matching shells across AP/PA; 0: combine all
+
+# --- Acquisition metadata ---
+ECHO_MS: 0.75            # total readout (echo spacing * (PE-1)) in ms (used for topup/eddy)
+PIFACTOR: 3              # parallel imaging factor (GRAPPA/SENSE) used in acqparams
+
+# --- Lower-shell & DTI ---
+LOWER_B: 1000            # target shell for DTI, skullstrip reference, etc.
+
+# --- BedpostX / XTRACT / Streamlines ---
+NO_GPU: false            # false = use GPU when available for bedpostx and xtract
+PTX_STEPLENGTH: 0.15      # probtrackx/xtract step length
+xtract_profiles_dir: /path/to/XTRACT/profiles   # must contain structureList and tract profiles
+species: CUSTOM          # passed to xtract
+
+# Streamlines (runs after XTRACT)
+STREAMLINES_DO: true
+STREAMLINES_PREFIX: /path/to/output_root/xtract/streamlines   # file prefix (no suffix)
+STREAMLINES_FORMAT: trk                 # trk or vtk
+STREAMLINES_DENSITY_THRESHOLD: 0.001
+STREAMLINES_NUM_JOBS: 4
+
+# --- Eddy options ---
+# Accepts a string or a list. These are appended to the eddy call.
+# Examples:
+#   "--b0_peas --session"
+#   "--b0_slm linear"
+eddy_extra_args: "--b0_peas --session"
+
+# --- Registration to NMT (default MMORF; can switch to FNIRT) ---
+registration_method: mmorf         # mmorf | fnirt
+# Override the default template paths (the pipeline ships defaults under invivo_dmri_pipeline/files)
+nmt_fa: /path/to/NMT_FA.nii.gz
+nmt_tensor: /path/to/NMT_tensor.nii.gz
+mmorf_config_template: /path/to/mmorf_config_template.ini

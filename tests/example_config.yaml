@@ -1,0 +1,23 @@
+# --- Required ---
+ECHO_MS: 0.403327         # ms
+PIFACTOR: 3
+LOWER_B: 1000
+
+# --- Optional knobs (defaults shown) ---
+B0RANGE: 60
+COMBINE_MATCHED_FLAG: 2
+PTX_STEPLENGTH: 0.15
+NO_GPU: false
+SWAP_DIMS: ["x","y","-z"]
+
+# --- Optional paths (dataset-specific) ---
+base_dir: ./test_vlad          # DICOM root
+search_str: diff_pt58iso       # substring to match series
+dmri_root: ./dmri_proc         # workspace root (will be absolutised)
+raw_nii: null                  # default = <dmri_root>/NIFTI_raw
+
+# External wrappers (optional; set if you run denoising)
+denoise_sh: /home/data/Denoising/code/denoise/run_denoise.sh
+
+# xtract profiles dir (optional; if omitted, uses packaged defaults/STD_NMT)
+xtract_profiles_dir: null
