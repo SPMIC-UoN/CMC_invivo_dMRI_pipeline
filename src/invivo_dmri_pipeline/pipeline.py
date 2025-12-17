@@ -542,8 +542,9 @@ def build_workflow(
     gibbs_n4.inputs.run_n4 = getattr(cfg, "run_n4", True)
     gibbs_n4.inputs.use_docker = getattr(cfg, "use_docker", True)
     gibbs_n4.inputs.container_runtime = getattr(cfg, "container_runtime", "docker")
-    gibbs_n4.inputs.gibbs_image = cfg.gibbs_image
-    gibbs_n4.inputs.n4_image = cfg.n4_image
+    # gibbs_n4.inputs.gibbs_image = cfg.gibbs_image
+    # gibbs_n4.inputs.n4_image = cfg.n4_image
+    gibbs_n4.inputs.docker_image = cfg.docker_image
     if hasattr(gibbs_n4.inputs, "interactive_tty"):
         gibbs_n4.inputs.interactive_tty = getattr(cfg, "interactive_tty", True)
     

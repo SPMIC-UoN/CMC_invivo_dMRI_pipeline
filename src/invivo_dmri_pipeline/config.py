@@ -66,8 +66,9 @@ class Config:
         self.container_runtime = str(y.get("container_runtime", "docker"))
 
         # Docker images (defaults pinned to MRtrix 3.0.7)
-        self.gibbs_image      = str(y.get("gibbs_image", "docker.io/mrtrix3/mrtrix3:3.0.7"))
-        self.n4_image         = str(y.get("n4_image", "docker.io/mrtrix3/mrtrix3:3.0.7"))
+        # self.gibbs_image      = str(y.get("gibbs_image", "docker.io/mrtrix3/mrtrix3:3.0.7"))
+        # self.n4_image         = str(y.get("n4_image", "docker.io/mrtrix3/mrtrix3:3.0.7"))
+        self.docker_image      = str(y.get("docker_image", "docker.io/mrtrix3/mrtrix3:3.0.7"))
         self.interactive_tty  = bool(y.get("interactive_tty", True))
 
         # Optional masks / inputs

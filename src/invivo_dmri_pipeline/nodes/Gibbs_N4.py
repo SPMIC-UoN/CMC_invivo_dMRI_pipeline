@@ -58,8 +58,9 @@ class GibbsN4InputSpec(BaseInterfaceInputSpec):
     interactive_tty   = traits.Bool(True,  usedefault=True, desc="add -it to docker/podman run")
 
     # Pin to MRtrix 3.0.7
-    gibbs_image = traits.Str("docker.io/mrtrix3/mrtrix3:3.0.7", usedefault=True)
-    n4_image    = traits.Str("docker.io/mrtrix3/mrtrix3:3.0.7", usedefault=True)
+    docker_image = traits.Str("docker.io/mrtrix3/mrtrix3:3.0.7", usedefault=True)
+    # gibbs_image = traits.Str("docker.io/mrtrix3/mrtrix3:3.0.7", usedefault=True)
+    # n4_image    = traits.Str("docker.io/mrtrix3/mrtrix3:3.0.7", usedefault=True)
 
     mask = File(exists=True, desc="optional nodif_brain_mask for N4")
 
@@ -128,7 +129,7 @@ class GibbsN4(BaseInterface):
                 # run mrdegibbs
                 if self.inputs.use_docker:
                     cmd = self._rt_prefix() + self._mounts(self.inputs.combined_dir, self.inputs.outdir_gibbs) + [
-                        self.inputs.gibbs_image,
+                        self.inputs.docker_image,
                         "mrdegibbs",
                         f"/data/{os.path.basename(img)}",
                         f"/out/{os.path.basename(out_img)}",
@@ -191,7 +192,7 @@ class GibbsN4(BaseInterface):
                         mask_opt = ["-mask", f"/mask/{os.path.basename(self.inputs.mask)}"]
 
                     cmd = self._rt_prefix() + mounts + [
-                        self.inputs.n4_image,
+                        self.inputs.docker_image,
                         "dwibiascorrect", "ants",
                         f"/data/{os.path.basename(img)}",
                         f"/out/{os.path.basename(oimg)}",
