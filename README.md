@@ -1,6 +1,6 @@
-# CMC In-Vivo dMRI Pipeline (Macaque, 10.5 T)
+# CMC In Vivo dMRI Pipeline (Macaque, 10.5 T)
 
-**Processing pipeline for in-vivo macaque ultra-high-field (10.5 T) dMRI data acquired as part of the Center for Mesoscale Connectomics (CMC).**
+**Processing pipeline for in vivo macaque ultra-high-field (10.5 T) dMRI data acquired as part of the Center for Mesoscale Connectomics (CMC).**
 
 **Citation:** Warrington et al. (in prep)
 
@@ -8,7 +8,7 @@
 
 ## 1) Overview
 
-This pipeline takes in-vivo macaque diffusion (phase blip pairs required) MRI, performs denoising, signal and sample drift correction, distortion corrections, skull-stripping, diffusion tensor modelling, regististration to NMT space, crossing fibre modelling, white matter bundle segmentation with XTRACT, and generates an overview QA report.
+This pipeline takes in-vivo macaque diffusion (phase blip pairs required) MRI, performs denoising, signal and sample drift correction, distortion corrections, skull-stripping, diffusion tensor modelling, regististration to standard space, crossing fibre modelling, white matter bundle segmentation with XTRACT, and generates an overview QA report.
 
 Command line entrypoint:
 
@@ -17,7 +17,7 @@ cmc_invivo_pipeline config.yaml -v
 ```
 
 The workflow is Nipype-based and modular. Most heavy lifting is in FSL, with optional Docker helpers for Gibbs and N4 steps.
-If the pipeline fails, or you need to adjust something, you can re-run from any point through Nipype caching framework. 
+If the pipeline fails, or you need to adjust something, you can re-run from any point through Nipype caching framework.
 
 ---
 
@@ -26,29 +26,15 @@ If the pipeline fails, or you need to adjust something, you can re-run from any 
 ### Core software
 - **Linux** with bash, coreutils
 - **Python 3.10+**  
-- **FSL 6.0.7.x or newer**  
-  Required tools: `topup`, `eddy` (or `eddy_cuda*`), `eddy_quad`, `bet4animal` or `bet`, and FSL utilities 
-  Set `FSLDIR` and add `${FSLDIR}/bin` to `PATH`
+- **FSL 6.0.7.x or newer**
 - **MRtrix3 3.0.7+**  
-  Used for optional Gibbs step
+  Used for optional Gibbs and N4 steps
   **Note on Docker:** you can run MRtrix tools in the `mrtrix3/mrtrix3` container
-- **ANTs**
-  Used for optional N4 bias correction step
-- **CUDA** (optional) for `eddy_cudaX` and GPU bedpostx  
+- **CUDA** for GPU `eddy`, bedpostx and XTRACT - these should be installed with FSL already  
   If no GPU, set `NO_GPU: true` in config to force CPU paths
-
-### Python packages (installed by the package)
-- `nipype`
-- `nibabel`
-- `numpy`, `scipy`
-- `matplotlib`
-- `reportlab`
-- `pyyaml`
 
 ### External scripts and resources
 - **Denoising wrapper script** (from https://github.com/SPMIC-UoN/EDDEN/tree/main/code). Path supplied in `config.yaml` as `denoise_sh`.
-- **XTRACT profiles directory** containing `structureList` and tract definitions. Path supplied as `xtract_profiles_dir` - can be the FSL default.
-- **MMORF config template** and NMT reference files are bundled in the package.
 
 ---
 
@@ -57,7 +43,7 @@ If the pipeline fails, or you need to adjust something, you can re-run from any 
 Below is a minimal, reproducible setup using Conda.
 
 1. **Install core software**
-   - Install **FSL**, **MRtrix3** and **ANTs**, and set environments.
+   - Install **FSL** and **MRtrix3**, and set environments.
 
 2. **Create a Python environment**
    ```bash
@@ -71,11 +57,6 @@ Below is a minimal, reproducible setup using Conda.
      pip install -e .
      ```
      This exposes the CLI `cmc_invivo_pipeline`.
-
-4. **Verify external assets**
-   - Ensure your **denoising wrapper** exists and is executable.
-   - Ensure **XTRACT profiles directory** is available and readable.
-
 ---
 
 ## 4) Input data requirements
@@ -104,47 +85,27 @@ A minimal example illustrates the key fields. Paths may be relative or absolute;
 
 ```yaml
 # Required roots
-dmri_root: /path/to/processing/proc             # output root
-input_root: /path/to/INPUT_ROOT                 # top of AP/PA (or LR/RL) folders
+dmri_root: /path/to/processing/proc
+input_root: /path/to/INPUT_ROOT
 
-# Denoising
-denoise_sh: /path/to/denoise_wrapper.sh         # site-specific NORDIC/denoise entry
+denoise_sh: /path/to/denoise_wrapper.sh
 
-# Drift and acquisition
-B0RANGE: 60                                     # threshold for identifying b0 volumes
-ECHO_MS: 0.34                                   # EPI echo spacing (ms) used for readout calc
-PIFACTOR: 3                                     # partial-Fourier factor for readout calc
+B0RANGE: 60                  # threshold for identifying b0 volumes
+ECHO_MS: 0.34                # echo spacing (ms)
+PIFACTOR: 3                  # parallel imaging factor (GRAPPA or equivalent)
 
-# Pre-EDDY and combine
-REMOVE_B0: true                                 # remove an initial b0 per run before combine
-run_gibbs: true                                 # apply Gibbs (via Docker if configured)
-run_n4: true                                    # apply N4 bias correction (via Docker if configured)
-use_docker: true                                # let pipeline call Docker for Gibbs/N4 helpers
-gibbs_image: mrtrix3/mrtrix3                    # Docker image to use for Gibbs
-n4_image: antsx/ants:latest                     # Docker image to use for N4
-interactive_tty: true                           # pass -it to docker (helps with HPC output)
+run_gibbs: true # run Gibbs unringing?
+run_n4: true # run bias field correction?
+use_docker: true
+docker_image: mrtrix3/mrtrix3
+interactive_tty: true
 
-# Eddy / Topup
-eddy_extra_args: ""
-COMBINE_MATCHED_FLAG: 1                         # 0: keep all volumes; 1: matched only
-
-# Skullstrip after EDDY (final mask)
-LOWER_B: 1000                                   # approximate value for “lower shell” selection
-brain_mask: null                                # optional precomputed mask
-t1: null                                        # optional T1 to assist skullstrip node
+LOWER_B: 1000
+brain_mask: null # option to supply a precomputed brain mask in T1 space
+t1: null # required if providing T1 space brain mask
 
 # Registration and tractography
-stdreg_method: mmorf                            # mmorf (default) or fnirt
-xtract_profiles_dir: /path/to/XTRACT_profiles   # must contain structureList + tracts
-PTX_STEPLENGTH: 0.1                             # tractography step for XTRACT
-NO_GPU: false                                   # set true on CPU-only systems
-
-# Streamlines (if enabled via XTRACT)
-STREAMLINES_DO: true
-STREAMLINES_DENSITY_THRESHOLD: 1e-3
-STREAMLINES_FORMAT: trk
-STREAMLINES_PTX2_PREFIX: densityNorm
-STREAMLINES_NUM_JOBS: 1
+stdreg_method: mmorf         # mmorf or fnirt
 
 ```
 
@@ -154,8 +115,7 @@ STREAMLINES_NUM_JOBS: 1
 - **`eddy_extra_args`** is passed directly to `eddy`. Add `--session` here if you want session-aware modeling. The pipeline will supply `--session=<series_index.txt>` automatically when `--session` is present.  
 - **`COMBINE_MATCHED_FLAG`** controls whether to keep all volumes after EDDY or only matched AP/PA pairs.  
 - **`LOWER_B`** defines the lower shell used for the DTI tensor fit.  
-- **`xtract_profiles_dir`** must point to valid XTRACT tract definitions for your species template.  
-- **Docker helpers**: when `use_docker: true`, Gibbs and N4 steps run inside containers you name in `gibbs_image` and `n4_image`.
+- **Docker helpers**: when `use_docker: true`, Gibbs and N4 steps run inside a container you name in `docker_image`.
 
 ---
 
@@ -165,25 +125,20 @@ Under `dmri_root` the pipeline creates:
 
 ```
 dmri_root/
-  AP_denoised/, PA_denoised/              # per-run denoise outputs and sidecars
-  data_combined*/                         # combined AP/PA (and Gibbs/N4 variants)
-  data_combined_drift/                    # drift-corrected pairs
   topup/                                  # Pos_Neg_b0 and topup products + nodif_brain_mask
   eddy/
     eddy_unwarped_images.nii.gz
-    Pos_Neg.bvals / Pos_Neg.bvecs
-    index.txt / acqparams.txt / series_index.txt
     eddy.qc/ qc.json + PNGs               # eddy_quad output directory
   data/
     data.nii.gz
     bvals / bvecs
-    nodif_brain_mask.nii.gz               # final mask after EDDY
+    nodif_brain_mask.nii.gz               
   dtifit/
     dti_FA.nii.gz, dti_V1.nii.gz, dti_tensor.nii.gz, ...
-  NMTreg/
-    FA_in_std.nii.gz, warps, QC PNGs
+  stdreg/
+    FA_in_std.nii.gz, warps
   xtract/
-    tract PNGs (viewer exports), tracts, stats
+    tract PNGs (viewer exports), tracts containging xtract tract density maps
   QA/
     QA_report.pdf                         # multi-page report
 ```
@@ -195,26 +150,9 @@ dmri_root/
 ```bash
 cmc_invivo_pipeline /path/to/config.yaml -v
 ```
-
+- `--preproc` sets the pipeline to only run pre-processing up to and including diffusion tensor modelling and standard space registrations.
+- `--tractography` sets the pipeline to additionally run crossing fibre modelling and landmark-based tractoraphy with XTRACT.
 - `-v` enables informative Nipype logging to help with debugging.
 - The pipeline copies your YAML into `dmri_root/invivo_dmri_config.yaml` for provenance.
-
----
-
-## 8) Troubleshooting
-
-- **`eddy_quad` fails with “directory already exists”**  
-  The pipeline explicitly sets `-o <dmri_root>/eddy/eddy.qc`. If you re-run and want a fresh QC, delete that folder first:
-  ```bash
-  rm -rf <dmri_root>/eddy/eddy.qc
-  ```
-- **No `eddy_cuda` on GPU systems**  
-  Ensure your CUDA install matches the `eddy_cuda*` binary you intend to use. Otherwise remove CUDA from `PATH` or set `NO_GPU: true` to force CPU EDDY.
-- **Missing sidecars**  
-  The pipeline requires `.bval` and `.bvec` for magnitude NIfTIs in AP/PA (or LR/RL). It will stop early if any are missing.
-- **Mixed PE schemes**  
-  Do not mix AP/PA and LR/RL in the same `input_root`. Use one scheme only.
-- **Masks or T1**  
-  You can provide a precomputed mask or T1 image if you need to override defaults for skull-strip after EDDY.
 
 ---
