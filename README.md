@@ -40,6 +40,9 @@ If the pipeline fails, or you need to adjust something, you can re-run from any 
 
 ## 3) Installation
 
+### Docker version: https://hub.docker.com/repository/docker/swarrington1/cmc-invivo
+- docker pull swarrington1/cmc-invivo:v0.1.0
+
 Below is a minimal, reproducible setup using Conda.
 
 1. **Install core software**
