@@ -23,7 +23,7 @@ Options:
 Behaviour:
   - Default run: converts DICOMs, reorients (if requested), fixes headers, then flips bvecs.
                  During bvec flipping, Z sign is inverted relative to -r to account for header fixes.
-  - --bvec-adjust run: skips DICOM/NIfTI steps, re-flips bvecs ONLY from *_orig.bvec -> *.bvec,
+  - --bvec-adjust run: skips DICOM/NIfTI steps, re-flips bvecs in AP/PA/AP_ph/PA_ph only,
                        applying exactly the -v/-r you specify (no extra Z inversion).
   - In all runs, a small dtifit sanity test is attempted on AP_1 if available.
   - If --remove-initial-b0 is set, the first volume is removed from diffusion series in
@@ -276,6 +276,7 @@ if ! $BVEC_ADJUST; then
     stem="${nii%.nii.gz}"
     [ -f "${stem}.bval" ] && cp -f "${stem}.bval" "${out_stem}.bval" || true
     [ -f "${stem}.bvec" ] && cp -f "${stem}.bvec" "${out_stem}.bvec" || true
+    [ -f "${stem}.json" ] && cp -f "${stem}.json" "${out_stem}.json" || true
   done
 
   # ---- Diffusion phase (only 'Pha') ----
@@ -320,6 +321,9 @@ if ! $BVEC_ADJUST; then
 
       mkdir -p "$subdir"
       run_prep "$nii" "${out_stem}.nii.gz"
+
+      stem="${nii%.nii.gz}"
+      [ -f "${stem}.json" ] && cp -f "${stem}.json" "${out_stem}.json" || true
     done
   else
     echo "Skipping phase series conversion (test mode)"
@@ -345,6 +349,9 @@ if ! $BVEC_ADJUST; then
 
       mkdir -p "$subdir"
       run_prep "$nii" "${out_stem}.nii.gz"
+
+      stem="${nii%.nii.gz}"
+      [ -f "${stem}.json" ] && cp -f "${stem}.json" "${out_stem}.json" || true
     done
   else
     echo "Skipping T1 conversion (test mode)"
@@ -400,29 +407,28 @@ if $TEST_MODE; then
   )
 else
   mapfile -d '' BVEC_LIST < <(
-    find "$OUT_DIR" -type f -name "*.bvec" -print0 || true
+    {
+      find "$OUT_DIR/AP"    -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/PA"    -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/AP_ph" -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/PA_ph" -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+    } || true
   )
 fi
 
 for bvec in "${BVEC_LIST[@]:-}"; do
-  orig="${bvec/.bvec/_orig.bvec}"
+  [ -f "$bvec" ] || continue
 
-  if [ ! -f "$orig" ]; then
-    if [ -f "$bvec" ]; then
-      echo "Backing up (move) $bvec -> $orig"
-      mv -f "$bvec" "$orig"
-    else
-      echo "warning: missing $bvec, skipping"
-      continue
-    fi
-  fi
+  echo "Flipping in place: $bvec"
+  tmp_bvec="${bvec}.tmp"
 
-  echo "Flipping: $orig -> $bvec"
   python3 "$BVECFLIP_PY" \
-    -in "$orig" \
-    -out "$bvec" \
+    -in "$bvec" \
+    -out "$tmp_bvec" \
     -vr "${vr_args[@]}" \
     -vf "$vf_x" "$vf_y" "$vf_z"
+
+  mv -f "$tmp_bvec" "$bvec"
 done
 
 # =========================
