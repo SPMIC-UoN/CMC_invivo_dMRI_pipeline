@@ -110,13 +110,6 @@ need_cmd dtifit
 need_cmd python3
 $BVEC_ADJUST || need_cmd dcm2niix
 
-python3 - <<'PY' >/dev/null 2>&1 || {
-  echo "Python3+numpy+nibabel required"
-  exit 1
-}
-import nibabel, numpy
-PY
-
 if $REMOVE_INITIAL_B0; then
   [ -f "$REMOVE_B0_PY" ] || {
     echo "error: remove_initial_b0 script not found: $REMOVE_B0_PY"
