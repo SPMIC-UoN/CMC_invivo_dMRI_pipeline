@@ -9,18 +9,24 @@ Usage:
 Options:
   -v, --v AX AY AZ          Axes for fslswapdim (default: x y z)
   -r, --r Sx Sy Sz          Signs for axes (1 or -1; default: 1 1 1)
-      --prep-py PATH        Path to prep_dmri_reorient.py
-                            (default: /home/data/NIH_CONNECTS/nipype_dev/prep_dmri_reorient.py)
-      --bvec-adjust         Reflip bvecs only (do NOT touch NIfTIs).
-                            Uses -v/-r exactly as provided (no extra Z inversion).
-                            Clears test_dtifit and reruns sanity dtifit.
+  --prep-py PATH        Path to prep_dmri_reorient.py
+                        (default: /home/data/NIH_CONNECTS/nipype_dev/prep_dmri_reorient.py)
+  --bvec-adjust         Reflip bvecs only (do NOT touch NIfTIs).
+                        Uses -v/-r exactly as provided (no extra Z inversion).
+                        Clears test_dtifit and reruns sanity dtifit.
+  --remove-initial-b0   Remove the first volume from each diffusion series
+                        before the dtifit sanity check.
+  --remove-b0-py PATH   Path to remove_initial_b0.py
+                        (default: /home/mszsaw2/remove_initial_b0.py)
 
-Behavior:
+Behaviour:
   - Default run: converts DICOMs, reorients (if requested), fixes headers, then flips bvecs.
                  During bvec flipping, Z sign is inverted relative to -r to account for header fixes.
   - --bvec-adjust run: skips DICOM/NIfTI steps, re-flips bvecs ONLY from *_orig.bvec -> *.bvec,
                        applying exactly the -v/-r you specify (no extra Z inversion).
   - In all runs, a small dtifit sanity test is attempted on AP_1 if available.
+  - If --remove-initial-b0 is set, the first volume is removed from diffusion series in
+    OUT_DIR/AP and OUT_DIR/PA after bvec flipping and before dtifit sanity testing.
 
 Notes:
   A suggested brain-extraction command is printed (not executed) for convenience.
@@ -42,6 +48,8 @@ BVECFLIP_PY="/home/data/NIH_CONNECTS/CMC_tools/bvecflip_generic.py"
 V=(x y z)
 R=(1 1 1)
 BVEC_ADJUST=false
+REMOVE_INITIAL_B0=false
+REMOVE_B0_PY="/home/mszsaw2/remove_initial_b0.py"
 
 # ---- Parse optional flags ----
 while (( "$#" )); do
@@ -65,6 +73,15 @@ while (( "$#" )); do
       BVEC_ADJUST=true
       shift 1
       ;;
+    --remove-initial-b0|--remove_initial_b0)
+      REMOVE_INITIAL_B0=true
+      shift 1
+      ;;
+    --remove-b0-py|--remove_b0_py)
+      [ "$#" -lt 2 ] && usage
+      REMOVE_B0_PY="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       usage
@@ -83,6 +100,10 @@ $BVEC_ADJUST || need_cmd dcm2niix   # only needed on full run
 python3 - <<'PY' >/dev/null 2>&1 || { echo "Python3+numpy+nibabel required"; exit 1; }
 import nibabel, numpy
 PY
+
+if $REMOVE_INITIAL_B0; then
+  [ -f "$REMOVE_B0_PY" ] || { echo "error: remove_initial_b0 script not found: $REMOVE_B0_PY"; exit 1; }
+fi
 
 # ---- Helpers ----
 latest_nii(){
@@ -120,6 +141,48 @@ PY
   fi
 }
 
+remove_initial_b0_in_dir(){
+  local indir="$1"
+
+  [ -d "$indir" ] || return 0
+
+  mapfile -t nii_list < <(
+    find "$indir" -maxdepth 1 -type f -name "*.nii.gz" | sort -V
+  )
+
+  if [ "${#nii_list[@]}" -eq 0 ]; then
+    echo "  No NIfTIs found in $indir for initial b0 removal."
+    return 0
+  fi
+
+  local tmpdir="${indir}/remove_initial_b0_tmp"
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  echo "  Running initial b0 removal in: $indir"
+  python3 "$REMOVE_B0_PY" \
+    -indat "${nii_list[@]}" \
+    -outdir "$tmpdir" \
+    --b0range 0
+
+  local trimmed_nii
+  for trimmed_nii in "$tmpdir"/*.nii.gz; do
+    [ -e "$trimmed_nii" ] || continue
+
+    local base stem
+    base="$(basename "$trimmed_nii")"
+    stem="${base%.nii.gz}"
+
+    mv -f "$tmpdir/${stem}.nii.gz" "$indir/${stem}.nii.gz"
+    mv -f "$tmpdir/${stem}.bval"   "$indir/${stem}.bval"
+    mv -f "$tmpdir/${stem}.bvec"   "$indir/${stem}.bvec"
+
+    echo "    Overwrote ${stem}.nii.gz/.bval/.bvec"
+  done
+
+  rm -rf "$tmpdir"
+}
+
 # =========================
 # Mode banner
 # =========================
@@ -136,6 +199,7 @@ echo "  DIFF SRCH: $SRCH"
 echo "  T1 SRCH:   $SRCH_T1"
 echo "  Orient V:  (${V[*]})"
 echo "  Orient R:  (${R[*]})"
+echo "  Remove initial b0: $REMOVE_INITIAL_B0"
 echo
 
 # =========================
@@ -271,7 +335,17 @@ for bvec in "${BVEC_LIST[@]:-}"; do
 done
 
 # =========================
-# Quick dtifit sanity check (clear if adjusting)
+# Optional initial b0 removal
+# =========================
+if $REMOVE_INITIAL_B0; then
+  echo
+  echo "Removing initial b0 volumes from AP/PA series..."
+  remove_initial_b0_in_dir "$OUT_DIR/AP"
+  remove_initial_b0_in_dir "$OUT_DIR/PA"
+fi
+
+# =========================
+# Quick dtifit sanity check
 # =========================
 echo
 echo "Running quick dtifit sanity check (AP_1 if available)..."
