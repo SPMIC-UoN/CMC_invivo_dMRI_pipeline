@@ -393,7 +393,8 @@ if $BVEC_ADJUST; then
 else
   vf_x="$vx"
   vf_y="$vy"
-  vf_z=$(( -1 * vz ))
+  vf_z="$vz"
+  # vf_z=$(( -1 * vz ))
   echo "  FULL RUN: applying Z inversion relative to provided -r."
 fi
 
