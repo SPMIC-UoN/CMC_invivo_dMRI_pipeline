@@ -7,17 +7,18 @@ Usage:
   $0 <DICOM_DIR> <OUT_DIR> <DIFF_SEARCH> <T1_SEARCH> [options]
 
 Options:
-  -v, --v AX AY AZ          Axes for fslswapdim (default: x y z)
-  -r, --r Sx Sy Sz          Signs for axes (1 or -1; default: 1 1 1)
-  --prep-py PATH        Path to prep_dmri_reorient.py
-                        (default: /home/data/NIH_CONNECTS/nipype_dev/prep_dmri_reorient.py)
-  --bvec-adjust         Reflip bvecs only (do NOT touch NIfTIs).
-                        Uses -v/-r exactly as provided (no extra Z inversion).
-                        Clears test_dtifit and reruns sanity dtifit.
-  --remove-initial-b0   Remove the first volume from each diffusion series
-                        before the dtifit sanity check.
-  --remove-b0-py PATH   Path to remove_initial_b0.py
-                        (default: /home/mszsaw2/remove_initial_b0.py)
+  -v, --v AX AY AZ        Axes for fslswapdim (default: x y z)
+  -r, --r Sx Sy Sz        Signs for axes (1 or -1; default: 1 1 1)
+  --prep-py PATH          Path to prep_dmri_reorient.py
+                          (default: /home/data/NIH_CONNECTS/nipype_dev/prep_dmri_reorient.py)
+  --bvec-adjust           Reflip bvecs only (do NOT touch NIfTIs).
+                          Uses -v/-r exactly as provided (no extra Z inversion).
+                          Clears test_dtifit and reruns sanity dtifit.
+  --remove-initial-b0     Remove the first volume from each diffusion series
+                          before the dtifit sanity check.
+  --remove-b0-py PATH     Path to remove_initial_b0.py
+                          (default: /home/mszsaw2/remove_initial_b0.py)
+  -test, --test           Test mode: only process AP_1
 
 Behaviour:
   - Default run: converts DICOMs, reorients (if requested), fixes headers, then flips bvecs.
@@ -27,6 +28,7 @@ Behaviour:
   - In all runs, a small dtifit sanity test is attempted on AP_1 if available.
   - If --remove-initial-b0 is set, the first volume is removed from diffusion series in
     OUT_DIR/AP and OUT_DIR/PA after bvec flipping and before dtifit sanity testing.
+  - -test/--test: only processes AP_1 so flips/orientation can be checked quickly.
 
 Notes:
   A suggested brain-extraction command is printed (not executed) for convenience.
@@ -50,6 +52,7 @@ R=(1 1 1)
 BVEC_ADJUST=false
 REMOVE_INITIAL_B0=false
 REMOVE_B0_PY="/home/mszsaw2/remove_initial_b0.py"
+TEST_MODE=false
 
 # ---- Parse optional flags ----
 while (( "$#" )); do
@@ -82,6 +85,10 @@ while (( "$#" )); do
       REMOVE_B0_PY="$2"
       shift 2
       ;;
+    -test|--test)
+      TEST_MODE=true
+      shift 1
+      ;;
     *)
       echo "Unknown option: $1"
       usage
@@ -90,19 +97,31 @@ while (( "$#" )); do
 done
 
 # ---- Tool checks ----
-need_cmd(){ command -v "$1" >/dev/null 2>&1 || { echo "error: $1 not found"; exit 1; }; }
+need_cmd(){
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "error: $1 not found"
+    exit 1
+  }
+}
+
 need_cmd fslroi
 need_cmd fslmaths
 need_cmd dtifit
 need_cmd python3
-$BVEC_ADJUST || need_cmd dcm2niix   # only needed on full run
+$BVEC_ADJUST || need_cmd dcm2niix
 
-python3 - <<'PY' >/dev/null 2>&1 || { echo "Python3+numpy+nibabel required"; exit 1; }
+python3 - <<'PY' >/dev/null 2>&1 || {
+  echo "Python3+numpy+nibabel required"
+  exit 1
+}
 import nibabel, numpy
 PY
 
 if $REMOVE_INITIAL_B0; then
-  [ -f "$REMOVE_B0_PY" ] || { echo "error: remove_initial_b0 script not found: $REMOVE_B0_PY"; exit 1; }
+  [ -f "$REMOVE_B0_PY" ] || {
+    echo "error: remove_initial_b0 script not found: $REMOVE_B0_PY"
+    exit 1
+  }
 fi
 
 # ---- Helpers ----
@@ -122,6 +141,7 @@ detect_tag(){
 run_prep(){
   local in_nii="$1"
   local out_nii="$2"
+
   if [[ "${V[*]}" == "x y z" && "${R[*]}" == "1 1 1" ]]; then
     python3 "$PREP_PY" -i "$in_nii" -o "$out_nii" --header-only --hard-fix-header
   else
@@ -200,6 +220,7 @@ echo "  T1 SRCH:   $SRCH_T1"
 echo "  Orient V:  (${V[*]})"
 echo "  Orient R:  (${R[*]})"
 echo "  Remove initial b0: $REMOVE_INITIAL_B0"
+echo "  Test mode: $TEST_MODE"
 echo
 
 # =========================
@@ -212,6 +233,7 @@ if ! $BVEC_ADJUST; then
   # ---- Diffusion magnitude (exclude 'Pha') ----
   ap=1
   pa=1
+
   for d in "$DICOM_DIR"/*"$SRCH"*; do
     [ -d "$d" ] || continue
     [[ "$d" == *Pha* ]] && continue
@@ -219,65 +241,121 @@ if ! $BVEC_ADJUST; then
 
     dcm2niix -z y -o "$OUT_DIR" "$d"
     nii="$(latest_nii "$OUT_DIR")"
-    [ -n "${nii:-}" ] || { echo "warning: no NIfTI found after converting $d"; continue; }
+    [ -n "${nii:-}" ] || {
+      echo "warning: no NIfTI found after converting $d"
+      continue
+    }
+
     tag="$(detect_tag "$base")"
 
     case "$tag" in
-      AP) subdir="$OUT_DIR/AP"; out_stem="${subdir}/AP_${ap}"; ((ap++)) ;;
-      PA) subdir="$OUT_DIR/PA"; out_stem="${subdir}/PA_${pa}"; ((pa++)) ;;
-      LR|RL) echo "ERROR: Detected $tag but only AP/PA outputs are supported."; exit 1 ;;
-      *) echo "Unknown tag for $base"; exit 1 ;;
+      AP)
+        if $TEST_MODE && [ "$ap" -ne 1 ]; then
+          echo "Skipping $base (test mode: only AP_1)"
+          continue
+        fi
+        subdir="$OUT_DIR/AP"
+        out_stem="${subdir}/AP_${ap}"
+        ((ap++))
+        ;;
+      PA)
+        if $TEST_MODE; then
+          echo "Skipping $base (test mode: only AP_1)"
+          continue
+        fi
+        subdir="$OUT_DIR/PA"
+        out_stem="${subdir}/PA_${pa}"
+        ((pa++))
+        ;;
+      LR|RL)
+        echo "ERROR: Detected $tag but only AP/PA outputs are supported."
+        exit 1
+        ;;
+      *)
+        echo "Unknown tag for $base"
+        exit 1
+        ;;
     esac
 
     mkdir -p "$subdir"
     run_prep "$nii" "${out_stem}.nii.gz"
 
-    # Move accompanying bval/bvec if match dcm2niix output stem
     stem="${nii%.nii.gz}"
     [ -f "${stem}.bval" ] && cp -f "${stem}.bval" "${out_stem}.bval" || true
     [ -f "${stem}.bvec" ] && cp -f "${stem}.bvec" "${out_stem}.bvec" || true
   done
 
   # ---- Diffusion phase (only 'Pha') ----
-  ap=1
-  pa=1
-  for d in "$DICOM_DIR"/*"$SRCH"*; do
-    [ -d "$d" ] || continue
-    [[ "$d" != *Pha* ]] && continue
-    base="$(basename "$d")"
+  if ! $TEST_MODE; then
+    ap=1
+    pa=1
 
-    dcm2niix -z y -o "$OUT_DIR" "$d"
-    nii="$(latest_nii "$OUT_DIR")"
-    [ -n "${nii:-}" ] || { echo "warning: no NIfTI found after converting $d"; continue; }
-    tag="$(detect_tag "$base")"
+    for d in "$DICOM_DIR"/*"$SRCH"*; do
+      [ -d "$d" ] || continue
+      [[ "$d" != *Pha* ]] && continue
+      base="$(basename "$d")"
 
-    case "$tag" in
-      AP) subdir="$OUT_DIR/AP_ph"; out_stem="${subdir}/AP_${ap}_ph"; ((ap++)) ;;
-      PA) subdir="$OUT_DIR/PA_ph"; out_stem="${subdir}/PA_${pa}_ph"; ((pa++)) ;;
-      LR|RL) echo "ERROR: Detected $tag in phase series but only AP_ph/PA_ph outputs are supported."; exit 1 ;;
-      *) echo "Unknown tag for $base"; exit 1 ;;
-    esac
+      dcm2niix -z y -o "$OUT_DIR" "$d"
+      nii="$(latest_nii "$OUT_DIR")"
+      [ -n "${nii:-}" ] || {
+        echo "warning: no NIfTI found after converting $d"
+        continue
+      }
 
-    mkdir -p "$subdir"
-    run_prep "$nii" "${out_stem}.nii.gz"
-  done
+      tag="$(detect_tag "$base")"
+
+      case "$tag" in
+        AP)
+          subdir="$OUT_DIR/AP_ph"
+          out_stem="${subdir}/AP_${ap}_ph"
+          ((ap++))
+          ;;
+        PA)
+          subdir="$OUT_DIR/PA_ph"
+          out_stem="${subdir}/PA_${pa}_ph"
+          ((pa++))
+          ;;
+        LR|RL)
+          echo "ERROR: Detected $tag in phase series but only AP_ph/PA_ph outputs are supported."
+          exit 1
+          ;;
+        *)
+          echo "Unknown tag for $base"
+          exit 1
+          ;;
+      esac
+
+      mkdir -p "$subdir"
+      run_prep "$nii" "${out_stem}.nii.gz"
+    done
+  else
+    echo "Skipping phase series conversion (test mode)"
+  fi
 
   # ---- T1 / anatomical ----
-  t1=1
-  for d in "$DICOM_DIR"/*"$SRCH_T1"*; do
-    [ -d "$d" ] || continue
+  if ! $TEST_MODE; then
+    t1=1
 
-    dcm2niix -z y -o "$OUT_DIR" "$d"
-    nii="$(latest_nii "$OUT_DIR")"
-    [ -n "${nii:-}" ] || { echo "warning: no NIfTI found after converting $d"; continue; }
+    for d in "$DICOM_DIR"/*"$SRCH_T1"*; do
+      [ -d "$d" ] || continue
 
-    subdir="$OUT_DIR/T1"
-    out_stem="${subdir}/T1_${t1}"
-    ((t1++))
+      dcm2niix -z y -o "$OUT_DIR" "$d"
+      nii="$(latest_nii "$OUT_DIR")"
+      [ -n "${nii:-}" ] || {
+        echo "warning: no NIfTI found after converting $d"
+        continue
+      }
 
-    mkdir -p "$subdir"
-    run_prep "$nii" "${out_stem}.nii.gz"
-  done
+      subdir="$OUT_DIR/T1"
+      out_stem="${subdir}/T1_${t1}"
+      ((t1++))
+
+      mkdir -p "$subdir"
+      run_prep "$nii" "${out_stem}.nii.gz"
+    done
+  else
+    echo "Skipping T1 conversion (test mode)"
+  fi
 fi
 
 # =========================
@@ -288,19 +366,34 @@ echo "Preparing bvec flip parameters..."
 
 vr_args=("${V[@]}")
 
-# Validate R signs
-vx="${R[0]}"; vy="${R[1]}"; vz="${R[2]}"
-case "$vx" in 1|-1) :;; *) echo "warning: Sx (${R[0]}) not in {1,-1}; defaulting to 1"; vx=1;; esac
-case "$vy" in 1|-1) :;; *) echo "warning: Sy (${R[1]}) not in {1,-1}; defaulting to 1"; vy=1;; esac
-case "$vz" in 1|-1) :;; *) echo "warning: Sz (${R[2]}) not in {1,-1}; defaulting to 1"; vz=1;; esac
+vx="${R[0]}"
+vy="${R[1]}"
+vz="${R[2]}"
+
+case "$vx" in
+  1|-1) : ;;
+  *) echo "warning: Sx (${R[0]}) not in {1,-1}; defaulting to 1"; vx=1 ;;
+esac
+
+case "$vy" in
+  1|-1) : ;;
+  *) echo "warning: Sy (${R[1]}) not in {1,-1}; defaulting to 1"; vy=1 ;;
+esac
+
+case "$vz" in
+  1|-1) : ;;
+  *) echo "warning: Sz (${R[2]}) not in {1,-1}; defaulting to 1"; vz=1 ;;
+esac
 
 if $BVEC_ADJUST; then
-  # EXACTLY as provided by user (no extra Z inversion)
-  vf_x="$vx"; vf_y="$vy"; vf_z="$vz"
+  vf_x="$vx"
+  vf_y="$vy"
+  vf_z="$vz"
   echo "  BVEC-ADJUST: using -vf exactly as provided."
 else
-  # Default full run: invert Z relative to user -r to account for header fixes
-  vf_x="$vx"; vf_y="$vy"; vf_z=$(( -1 * vz ))
+  vf_x="$vx"
+  vf_y="$vy"
+  vf_z=$(( -1 * vz ))
   echo "  FULL RUN: applying Z inversion relative to provided -r."
 fi
 
@@ -308,15 +401,20 @@ echo "  -vr ${vr_args[*]}"
 echo "  -vf ${vf_x} ${vf_y} ${vf_z}"
 echo
 
-# Flip each .bvec (always from *_orig.bvec -> *.bvec)
-# If *_orig.bvec doesn't exist yet, MOVE current .bvec -> _orig.bvec first
-mapfile -d '' BVEC_LIST < <(find "$OUT_DIR" -type f -name "*.bvec" -print0 || true)
+if $TEST_MODE; then
+  mapfile -d '' BVEC_LIST < <(
+    find "$OUT_DIR/AP" -maxdepth 1 -type f -name "AP_1.bvec" -print0 2>/dev/null || true
+  )
+else
+  mapfile -d '' BVEC_LIST < <(
+    find "$OUT_DIR" -type f -name "*.bvec" -print0 || true
+  )
+fi
 
 for bvec in "${BVEC_LIST[@]:-}"; do
   orig="${bvec/.bvec/_orig.bvec}"
 
   if [ ! -f "$orig" ]; then
-    # First time seeing this bvec: move .bvec -> _orig.bvec
     if [ -f "$bvec" ]; then
       echo "Backing up (move) $bvec -> $orig"
       mv -f "$bvec" "$orig"
@@ -339,9 +437,14 @@ done
 # =========================
 if $REMOVE_INITIAL_B0; then
   echo
-  echo "Removing initial b0 volumes from AP/PA series..."
-  remove_initial_b0_in_dir "$OUT_DIR/AP"
-  remove_initial_b0_in_dir "$OUT_DIR/PA"
+  echo "Removing initial b0 volumes from diffusion series..."
+
+  if $TEST_MODE; then
+    remove_initial_b0_in_dir "$OUT_DIR/AP"
+  else
+    remove_initial_b0_in_dir "$OUT_DIR/AP"
+    remove_initial_b0_in_dir "$OUT_DIR/PA"
+  fi
 fi
 
 # =========================
@@ -349,6 +452,7 @@ fi
 # =========================
 echo
 echo "Running quick dtifit sanity check (AP_1 if available)..."
+
 TESTDIR="$OUT_DIR/test_dtifit"
 rm -rf "$TESTDIR"
 mkdir -p "$TESTDIR"
@@ -361,11 +465,12 @@ if [[ -f "$AP1_NII" && -f "$AP1_BVEC" && -f "$AP1_BVAL" ]]; then
   fslroi "$AP1_NII" "$TESTDIR/mask" 0 1
   fslmaths "$TESTDIR/mask" -mul 0 -add 1 -bin "$TESTDIR/mask"
 
-  dtifit -k "$AP1_NII" \
-         -m "$TESTDIR/mask" \
-         -o "$TESTDIR/dti" \
-         -r "$AP1_BVEC" \
-         -b "$AP1_BVAL" || echo "warning: dtifit sanity check failed (continuing)..."
+  dtifit \
+    -k "$AP1_NII" \
+    -m "$TESTDIR/mask" \
+    -o "$TESTDIR/dti" \
+    -r "$AP1_BVEC" \
+    -b "$AP1_BVAL" || echo "warning: dtifit sanity check failed (continuing)..."
 else
   echo "  Skipping: AP_1 (nii/bvec/bval) not all present."
 fi
@@ -375,10 +480,12 @@ fi
 # =========================
 echo
 echo "Heads up: here is a brain-extraction command for you to adjust and run manually if desired:"
+
 T1_CAND="$(latest_nii "$OUT_DIR/T1")"
 if [ -n "${T1_CAND:-}" ]; then
   FULL_T1="$(abs_path "$T1_CAND")"
   FULL_OUT="$(abs_path "$OUT_DIR")"
+
   echo
   echo "  bet4animal \"$FULL_T1\" \"$FULL_OUT/t1\" -n -z 2 -m -R -f 0.5 -g 0"
   echo
@@ -391,8 +498,9 @@ fi
 echo
 echo "Done -> $(abs_path "$OUT_DIR")"
 echo "  Mode: $($BVEC_ADJUST && echo 'BVEC-ADJUST' || echo 'FULL')"
-echo "  Diff magnitude: $OUT_DIR/AP and $OUT_DIR/PA"
-echo "  Diff phase:     $OUT_DIR/AP_ph and $OUT_DIR/PA_ph"
-echo "  T1:             $OUT_DIR/T1"
+echo "  Test mode:        $TEST_MODE"
+echo "  Diff magnitude:   $OUT_DIR/AP and $OUT_DIR/PA"
+echo "  Diff phase:       $OUT_DIR/AP_ph and $OUT_DIR/PA_ph"
+echo "  T1:               $OUT_DIR/T1"
 echo "  bvecs flipped with: -vr ${vr_args[*]}  -vf ${vf_x} ${vf_y} ${vf_z}"
 echo "  dtifit sanity outputs: $TESTDIR"
