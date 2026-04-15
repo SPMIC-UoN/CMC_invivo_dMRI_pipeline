@@ -211,24 +211,26 @@ class PrepareTopupEddy(BaseInterface):
 
         return float(f"{ro_time_s:.6f}")
 
-    def _pick_first_b0_indices(
+    def _pick_first_b0_index_first_run(
         self,
         bvals: List[float],
         run_lengths: List[int],
         b0max: float,
-    ) -> List[int]:
-        idxs: List[int] = []
-        offset = 0
-        for L in run_lengths:
-            found = None
-            for rel in range(L):
-                if bvals[offset + rel] <= b0max:
-                    found = offset + rel
-                    break
-            if found is not None:
-                idxs.append(found)
-            offset += L
-        return idxs
+    ) -> int:
+        """
+        Return the index of the first b0 in the first run only.
+        """
+        if not run_lengths:
+            raise RuntimeError("run_lengths is empty")
+
+        first_run_len = run_lengths[0]
+        for rel in range(first_run_len):
+            if bvals[rel] <= b0max:
+                return rel
+
+        raise RuntimeError(
+            f"No b0 (<= {b0max}) found in first run of length {first_run_len}"
+        )
 
     def _run_interface(self, runtime):
         ap_file = os.path.abspath(self.inputs.ap_file)
@@ -346,38 +348,27 @@ class PrepareTopupEddy(BaseInterface):
             f.write(" ".join(str(i) for i in series_vals) + "\n")
 
         # ------------------------------------------------------------------
-        # 3) Build TOPUP b0 stack: 1 b0 per run, AP runs then PA runs
+        # 3) Build TOPUP b0 stack: first b0 from first AP run and first PA run
         # ------------------------------------------------------------------
         b0max = float(self.inputs.b0max)
 
-        ap_b0_idxs = self._pick_first_b0_indices(ap_bvals, ap_run_lengths, b0max)
-        pa_b0_idxs = self._pick_first_b0_indices(pa_bvals, pa_run_lengths, b0max)
+        ap_b0_idx = self._pick_first_b0_index_first_run(ap_bvals, ap_run_lengths, b0max)
+        pa_b0_idx = self._pick_first_b0_index_first_run(pa_bvals, pa_run_lengths, b0max)
 
-        if len(ap_b0_idxs) != n_ap_runs or len(pa_b0_idxs) != n_pa_runs:
-            raise RuntimeError(
-                "Expected exactly one b0 per run for TOPUP.\n"
-                f"AP runs: {n_ap_runs}, AP b0s found: {len(ap_b0_idxs)}; "
-                f"PA runs: {n_pa_runs}, PA b0s found: {len(pa_b0_idxs)}."
-            )
+        ap_b0_file = os.path.join(topup_dir, f"AP_b0_{ap_b0_idx}.nii.gz")
+        pa_b0_file = os.path.join(topup_dir, f"PA_b0_{pa_b0_idx}.nii.gz")
 
-        # Extract one b0 per run into temporary files, then merge.
-        tmp_b0_files: List[str] = []
-        for idx in ap_b0_idxs:
-            out = os.path.join(topup_dir, f"AP_b0_{idx}.nii.gz")
-            _run(["fslroi", ap_file, out, "0", "-1", "0", "-1", "0", "-1", str(idx), "1"])
-            tmp_b0_files.append(out)
-
-        for idx in pa_b0_idxs:
-            out = os.path.join(topup_dir, f"PA_b0_{idx}.nii.gz")
-            _run(["fslroi", pa_file, out, "0", "-1", "0", "-1", "0", "-1", str(idx), "1"])
-            tmp_b0_files.append(out)
+        _run(["fslroi", ap_file, ap_b0_file, "0", "-1", "0", "-1", "0", "-1", str(ap_b0_idx), "1"])
+        _run(["fslroi", pa_file, pa_b0_file, "0", "-1", "0", "-1", "0", "-1", str(pa_b0_idx), "1"])
 
         pos_neg_b0 = os.path.join(topup_dir, "Pos_Neg_b0.nii.gz")
-        _run(["fslmerge", "-t", pos_neg_b0] + tmp_b0_files)
+        _run(["fslmerge", "-t", pos_neg_b0, ap_b0_file, pa_b0_file])
 
-        # TOPUP acqparams: identical values to EDDY (but in topup/ directory)
+        # TOPUP acqparams: two rows, matching AP_1 then PA_1
         acqparams_topup = os.path.join(topup_dir, "acqparams.txt")
-        shutil.copy2(acqparams_eddy, acqparams_topup)
+        with open(acqparams_topup, "w") as f:
+            f.write(f"{gx_ap_i:d} {gy_ap_i:d} {gz_ap_i:d} {ro:.6f}\n")
+            f.write(f"{gx_pa_i:d} {gy_pa_i:d} {gz_pa_i:d} {ro:.6f}\n")
         
         # Choose b02b0 config by divisibility of image dims
         fsldir = FSL
