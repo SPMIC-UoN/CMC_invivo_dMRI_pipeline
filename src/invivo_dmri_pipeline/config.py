@@ -1,3 +1,4 @@
+# src/invivo_dmri_pipeline/config.py
 import os
 import yaml
 from typing import Any, Dict, List, Optional, Union
@@ -16,14 +17,12 @@ def _abspath_list(xs: Optional[List[str]]) -> Optional[List[str]]:
 
 
 def _lower_keys(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a copy of dict `d` with all keys lowercased."""
     return {k.lower(): v for k, v in d.items()}
 
 
 class Config:
     """
     Parse and hold pipeline configuration loaded from YAML.
-    All keys are case-insensitive (normalised to lowercase).
     """
     def __init__(self, y: Dict[str, Any]) -> None:
         # Normalise key case
@@ -31,9 +30,8 @@ class Config:
 
         # ---- required numeric ----
         try:
-            self.ECHO_MS  = float(y["echo_ms"])
-            self.PIFACTOR = int(y["pifactor"])
-            self.LOWER_B  = int(y["lower_b"])
+            self.TOTAL_READOUT_TIME = float(y["total_readout_time"])
+            self.LOWER_B = int(y["lower_b"])
         except KeyError as e:
             raise RuntimeError(f"Missing required config key: {e.args[0]}")
 
@@ -153,8 +151,7 @@ class Config:
     def __repr__(self) -> str:
         fields = {
             "MODE": self.MODE,
-            "ECHO_MS": self.ECHO_MS,
-            "PIFACTOR": self.PIFACTOR,
+            "TOTAL_READOUT_TIME": self.TOTAL_READOUT_TIME,
             "LOWER_B": self.LOWER_B,
             "B0RANGE": self.B0RANGE,
             "DENOISE": self.DENOISE,

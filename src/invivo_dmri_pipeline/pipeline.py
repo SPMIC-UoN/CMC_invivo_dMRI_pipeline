@@ -168,8 +168,7 @@ def build_workflow(
     print(f"[pipeline] run_mode = {run_mode}")
 
     B0RANGE = float(cfg.B0RANGE)
-    ECHO_MS = float(cfg.ECHO_MS)
-    PIFACTOR = int(cfg.PIFACTOR)
+    TOTAL_READOUT_TIME = float(cfg.TOTAL_READOUT_TIME)
     LOWER_B = int(cfg.LOWER_B)
     COMBINE_MATCHED_FLAG = int(cfg.COMBINE_MATCHED_FLAG)
     PTX_STEPLENGTH = float(cfg.PTX_STEPLENGTH)
@@ -649,8 +648,7 @@ def build_workflow(
     prep_te = pe.Node(PrepareTopupEddy(), name="prep_topup_eddy")
     prep_te.inputs.out_root = dmri_root
     prep_te.inputs.pedir_axis = "auto"
-    prep_te.inputs.echo_ms = ECHO_MS
-    prep_te.inputs.pifactor = PIFACTOR
+    prep_te.inputs.total_readout_time = TOTAL_READOUT_TIME
     prep_te.inputs.b0max = B0RANGE
 
     wf.connect(pick_pos_drift, "out", prep_te, "ap_file")

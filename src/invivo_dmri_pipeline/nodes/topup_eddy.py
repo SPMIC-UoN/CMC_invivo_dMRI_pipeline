@@ -110,8 +110,7 @@ class PrepareTopupEddyInputSpec(BaseInterfaceInputSpec):
 
     out_root = Directory(mandatory=True, desc="root processing directory")
     pedir_axis = traits.Enum("auto", "i", "j", "k", usedefault=True, desc="phase encode axis")
-    echo_ms = traits.Float(mandatory=True, desc="echo spacing (ms) or similar")
-    pifactor = traits.Int(mandatory=True, desc="parallel imaging factor")
+    total_readout_time = traits.Float(mandatory=True, desc="total readout time in seconds for TOPUP/EDDY acqparams 4th column")
     b0max = traits.Float(usedefault=True, default_value=60.0, desc="b threshold for b0")
 
 
@@ -159,58 +158,7 @@ class PrepareTopupEddy(BaseInterface):
 
         # Fallback
         return (0.0, -1.0, 0.0) if ap_like else (0.0, 1.0, 0.0)
-
-    def _total_readout(self) -> float:
-        """
-        Compute total readout time (s)
-
-            nPEsteps  = dimPhaseEncode - 1
-            ro_time_s = (echo_ms / pifactor) * nPEsteps / 1000
-
-        where:
-          - echo_ms   is echo spacing in ms
-          - pifactor  is the GRAPPA / parallel imaging factor
-        """
-        ap_file = os.path.abspath(self.inputs.ap_file)
-        pedir = self.inputs.pedir_axis
-        echo_ms = float(self.inputs.echo_ms)
-        pifactor = int(self.inputs.pifactor)
-
-        if pifactor <= 0:
-            raise RuntimeError("pifactor must be > 0")
-        
-        if pedir == "auto":
-            base_ap = os.path.basename(ap_file).upper()
-            if "AP" in base_ap or "PA" in base_ap:
-                pedir = "j"
-            elif "LR" in base_ap or "RL" in base_ap:
-                pedir = "i"
-            else:
-                pedir = "j"
-
-        # Map pedir → phase-encode dimension
-        if pedir == "i":
-            dim = "dim1"
-        elif pedir == "j":
-            dim = "dim2"
-        elif pedir == "k":
-            dim = "dim3"
-        else:
-            dim = "dim2"  # fallback
-        
-        fslval = os.path.join(FSL, "bin", "fslval")
-        dimP_str = subprocess.check_output(
-            [fslval, ap_file, dim],
-            text=True
-        ).strip().split()[0]
-        dimP = int(dimP_str)
-
-        nPEsteps = dimP - 1
-        ro_time_ms = (echo_ms / pifactor) * nPEsteps
-        ro_time_s = ro_time_ms / 1000.0
-
-        return float(f"{ro_time_s:.6f}")
-
+    
     def _pick_first_b0_index_first_run(
         self,
         bvals: List[float],
@@ -279,7 +227,10 @@ class PrepareTopupEddy(BaseInterface):
         gx_ap, gy_ap, gz_ap = self._vector_for_direction(ap_like=True)
         gx_pa, gy_pa, gz_pa = self._vector_for_direction(ap_like=False)
 
-        ro = self._total_readout()
+        ro = float(self.inputs.total_readout_time)
+        if ro <= 0:
+            raise RuntimeError(f"total_readout_time must be > 0, got {ro}")
+        ro = float(f"{ro:.6f}")
 
         def _int_vec(x):
             return int(round(x))
@@ -713,7 +664,7 @@ class PostEddyCombine(CommandLine):
 
         eddy_unwarped = os.path.join(eddy_dir, "eddy_unwarped_images.nii.gz")
         posneg_bvals = os.path.join(eddy_dir, "Pos_Neg.bvals")
-        posneg_bvecs = os.path.join(eddy_dir, "Pos_Neg.bvecs")
+        eddy_rot_bvecs = os.path.join(eddy_dir, "eddy_unwarped_images.eddy_rotated_bvecs")
 
         eddy_combine_bin = os.path.join(fslbin, "eddy_combine")
         onlymatched = 1 if int(self.inputs.combine_matched_flag) == 1 else 0
@@ -721,7 +672,7 @@ class PostEddyCombine(CommandLine):
         if onlymatched == 0:
             subprocess.run([os.path.join(fslbin, "imcp"), eddy_unwarped, data_out], check=True)
             shutil.copy2(posneg_bvals, bvals_out)
-            shutil.copy2(posneg_bvecs, bvecs_out)
+            shutil.copy2(eddy_rot_bvecs, bvecs_out)
         else:
             pos_vols = _count_bvals(self.inputs.pos_bval)
             neg_vols = _count_bvals(self.inputs.neg_bval)
