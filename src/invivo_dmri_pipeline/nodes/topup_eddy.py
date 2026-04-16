@@ -250,11 +250,8 @@ class PrepareTopupEddy(BaseInterface):
         _ensure_dir(eddy_dir)
 
         # ------------------------------------------------------------------
-        # 1) Build Pos_Neg (AP + PA) and combined sidecars for EDDY
+        # Read sidecars and sanity-check lengths
         # ------------------------------------------------------------------
-        pos_neg = os.path.join(eddy_dir, "Pos_Neg.nii.gz")
-        _run(["fslmerge", "-t", pos_neg, ap_file, pa_file])
-
         ap_bvals = _read_bvals(ap_bval)
         pa_bvals = _read_bvals(pa_bval)
         vx_ap, vy_ap, vz_ap = _read_bvecs(ap_bvec)
@@ -262,22 +259,6 @@ class PrepareTopupEddy(BaseInterface):
 
         if len(ap_bvals) != len(vx_ap) or len(pa_bvals) != len(vx_pa):
             raise RuntimeError("Mismatch between bvals and bvecs length in AP or PA.")
-
-        bvals_all = ap_bvals + pa_bvals
-        vx_all = vx_ap + vx_pa
-        vy_all = vy_ap + vy_pa
-        vz_all = vz_ap + vz_pa
-
-        bvals_all_path = os.path.join(eddy_dir, "bvals")
-        bvecs_all_path = os.path.join(eddy_dir, "bvecs")
-        _write_bvals(bvals_all_path, bvals_all)
-        _write_bvecs(bvecs_all_path, vx_all, vy_all, vz_all)
-
-        # ------------------------------------------------------------------
-        # 2) Build EDDY acqparams (1 row per run) and index (1 entry per vol)
-        # ------------------------------------------------------------------
-        n_ap_runs = len(ap_run_lengths)
-        n_pa_runs = len(pa_run_lengths)
 
         if sum(ap_run_lengths) != len(ap_bvals):
             raise RuntimeError(
@@ -289,13 +270,15 @@ class PrepareTopupEddy(BaseInterface):
                 f"Sum(pa_run_lengths) = {sum(pa_run_lengths)} "
                 f"but PA bvals length = {len(pa_bvals)}"
             )
-        
+
+        # ------------------------------------------------------------------
+        # Common PE convention for TOPUP and EDDY:
+        #   row 1 = AP
+        #   row 2 = PA
+        # ------------------------------------------------------------------
         gx_ap, gy_ap, gz_ap = self._vector_for_direction(ap_like=True)
         gx_pa, gy_pa, gz_pa = self._vector_for_direction(ap_like=False)
 
-        # ------------------------------------------------------------------
-        # Build acqparams.txt: integers for direction, float for readout time
-        # ------------------------------------------------------------------
         ro = self._total_readout()
 
         def _int_vec(x):
@@ -309,51 +292,22 @@ class PrepareTopupEddy(BaseInterface):
         gy_pa_i = _int_vec(gy_pa)
         gz_pa_i = _int_vec(gz_pa)
 
-        acqp_lines: List[str] = []
-        for _ in range(n_ap_runs):
-            acqp_lines.append(f"{gx_ap_i:d} {gy_ap_i:d} {gz_ap_i:d} {ro:.6f}")
-        for _ in range(n_pa_runs):
-            acqp_lines.append(f"{gx_pa_i:d} {gy_pa_i:d} {gz_pa_i:d} {ro:.6f}")
-
-        acqparams_eddy = os.path.join(eddy_dir, "acqparams.txt")
-        with open(acqparams_eddy, "w") as f:
-            f.write("\n".join(acqp_lines) + "\n")
-
-        # Build index.txt: for each volume in AP then PA, assign run ID 1..(n_ap + n_pa)
-        index_vals: List[int] = []
-        series_vals: List[int] = []
-
-        run_id = 1
-        for L in ap_run_lengths:
-            index_vals.extend([run_id] * L)
-            series_vals.extend([run_id] * L)
-            run_id += 1
-
-        for L in pa_run_lengths:
-            index_vals.extend([run_id] * L)
-            series_vals.extend([run_id] * L)
-            run_id += 1
-
-        if len(index_vals) != len(bvals_all):
-            raise RuntimeError(
-                f"index length {len(index_vals)} != number of volumes {len(bvals_all)}"
-            )
-
-        idx_txt = os.path.join(eddy_dir, "index.txt")
-        with open(idx_txt, "w") as f:
-            f.write(" ".join(str(i) for i in index_vals) + "\n")
-
-        series_idx = os.path.join(eddy_dir, "series.txt")
-        with open(series_idx, "w") as f:
-            f.write(" ".join(str(i) for i in series_vals) + "\n")
-
         # ------------------------------------------------------------------
-        # 3) Build TOPUP b0 stack: first b0 from first AP run and first PA run
+        # 1) Build TOPUP b0 stack: first b0 from first AP run and first PA run
         # ------------------------------------------------------------------
         b0max = float(self.inputs.b0max)
 
         ap_b0_idx = self._pick_first_b0_index_first_run(ap_bvals, ap_run_lengths, b0max)
         pa_b0_idx = self._pick_first_b0_index_first_run(pa_bvals, pa_run_lengths, b0max)
+
+        print(
+            f"[PrepareTopupEddy] Using TOPUP b0s: "
+            f"AP first-run index {ap_b0_idx}, PA first-run index {pa_b0_idx}"
+        )
+        print(
+            f"[PrepareTopupEddy] First run lengths: "
+            f"AP={ap_run_lengths[0]}, PA={pa_run_lengths[0]}"
+        )
 
         ap_b0_file = os.path.join(topup_dir, f"AP_b0_{ap_b0_idx}.nii.gz")
         pa_b0_file = os.path.join(topup_dir, f"PA_b0_{pa_b0_idx}.nii.gz")
@@ -364,13 +318,17 @@ class PrepareTopupEddy(BaseInterface):
         pos_neg_b0 = os.path.join(topup_dir, "Pos_Neg_b0.nii.gz")
         _run(["fslmerge", "-t", pos_neg_b0, ap_b0_file, pa_b0_file])
 
-        # TOPUP acqparams: two rows, matching AP_1 then PA_1
+        # TOPUP acqparams: exactly two rows, AP then PA
         acqparams_topup = os.path.join(topup_dir, "acqparams.txt")
         with open(acqparams_topup, "w") as f:
             f.write(f"{gx_ap_i:d} {gy_ap_i:d} {gz_ap_i:d} {ro:.6f}\n")
             f.write(f"{gx_pa_i:d} {gy_pa_i:d} {gz_pa_i:d} {ro:.6f}\n")
-        
-        # Choose b02b0 config by divisibility of image dims
+
+        print(f"[PrepareTopupEddy] Wrote TOPUP acqparams: {acqparams_topup}")
+
+        # ------------------------------------------------------------------
+        # 2) Choose TOPUP config by image-dimension divisibility
+        # ------------------------------------------------------------------
         fsldir = FSL
         if not fsldir:
             raise RuntimeError("FSL (FSLDIR) path is not set in utils.FSL.")
@@ -390,7 +348,79 @@ class PrepareTopupEddy(BaseInterface):
 
         if not os.path.isfile(topup_config):
             raise RuntimeError(f"TOPUP config not found at {topup_config}")
-        
+
+        print(f"[PrepareTopupEddy] Using TOPUP config: {topup_config}")
+
+        # ------------------------------------------------------------------
+        # 3) Build Pos_Neg (AP + PA) and combined sidecars for EDDY
+        # ------------------------------------------------------------------
+        pos_neg = os.path.join(eddy_dir, "Pos_Neg.nii.gz")
+        _run(["fslmerge", "-t", pos_neg, ap_file, pa_file])
+
+        bvals_all = ap_bvals + pa_bvals
+        vx_all = vx_ap + vx_pa
+        vy_all = vy_ap + vy_pa
+        vz_all = vz_ap + vz_pa
+
+        # Use Pos_Neg.* naming to match downstream PostEddyCombine expectations
+        bvals_all_path = os.path.join(eddy_dir, "Pos_Neg.bvals")
+        bvecs_all_path = os.path.join(eddy_dir, "Pos_Neg.bvecs")
+        _write_bvals(bvals_all_path, bvals_all)
+        _write_bvecs(bvecs_all_path, vx_all, vy_all, vz_all)
+
+        print(f"[PrepareTopupEddy] Wrote merged EDDY input: {pos_neg}")
+        print(f"[PrepareTopupEddy] Wrote merged sidecars: {bvals_all_path}, {bvecs_all_path}")
+
+        # ------------------------------------------------------------------
+        # 4) Copy common 2-row acqparams into EDDY dir
+        # ------------------------------------------------------------------
+        acqparams_eddy = os.path.join(eddy_dir, "acqparams.txt")
+        shutil.copy2(acqparams_topup, acqparams_eddy)
+
+        print(f"[PrepareTopupEddy] Copied common 2-row acqparams to EDDY: {acqparams_eddy}")
+
+        # ------------------------------------------------------------------
+        # 5) Build EDDY index: all AP vols -> 1, all PA vols -> 2
+        # ------------------------------------------------------------------
+        index_vals: List[int] = [1] * len(ap_bvals) + [2] * len(pa_bvals)
+
+        if len(index_vals) != len(bvals_all):
+            raise RuntimeError(
+                f"index length {len(index_vals)} != number of volumes {len(bvals_all)}"
+            )
+
+        idx_txt = os.path.join(eddy_dir, "index.txt")
+        with open(idx_txt, "w") as f:
+            f.write(" ".join(str(i) for i in index_vals) + "\n")
+
+        print("[PrepareTopupEddy] Wrote EDDY index with AP->1 and PA->2")
+
+        # ------------------------------------------------------------------
+        # 6) Build per-volume series file (per-run IDs), if used later
+        # ------------------------------------------------------------------
+        series_vals: List[int] = []
+        run_id = 1
+        for L in ap_run_lengths:
+            series_vals.extend([run_id] * L)
+            run_id += 1
+        for L in pa_run_lengths:
+            series_vals.extend([run_id] * L)
+            run_id += 1
+
+        if len(series_vals) != len(bvals_all):
+            raise RuntimeError(
+                f"series length {len(series_vals)} != number of volumes {len(bvals_all)}"
+            )
+
+        series_idx = os.path.join(eddy_dir, "series.txt")
+        with open(series_idx, "w") as f:
+            f.write(" ".join(str(i) for i in series_vals) + "\n")
+
+        print(f"[PrepareTopupEddy] Wrote series file: {series_idx}")
+
+        # ------------------------------------------------------------------
+        # Save outputs
+        # ------------------------------------------------------------------
         self._pos_neg = pos_neg
         self._pos_neg_b0 = pos_neg_b0
         self._acqparams_eddy = acqparams_eddy
