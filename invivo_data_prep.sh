@@ -22,9 +22,13 @@ Options:
 
 Behaviour:
   - Default run: converts DICOMs, reorients (if requested), fixes headers, then flips bvecs.
-                 During bvec flipping, Z sign is inverted relative to -r to account for header fixes.
-  - --bvec-adjust run: skips DICOM/NIfTI steps, re-flips bvecs in AP/PA/AP_ph/PA_ph only,
-                       applying exactly the -v/-r you specify (no extra Z inversion).
+                 During bvec flipping, Z sign is currently kept as provided.
+  - --bvec-adjust run: skips DICOM/NIfTI steps, re-flips bvecs only,
+                       applying exactly the -v/-r you specify.
+  - AP/PA stay AP/PA
+  - LR/RL stay LR/RL
+  - HF/FH are mapped to AP/PA respectively
+  - Derived diffusion series (e.g. ADC/TRACEW/FA/ColFA) are skipped
   - In all runs, a small dtifit sanity test is attempted on AP_1 if available.
   - If --remove-initial-b0 is set, the first volume is removed from diffusion series in
     OUT_DIR/AP and OUT_DIR/PA after bvec flipping and before dtifit sanity testing.
@@ -124,11 +128,27 @@ latest_nii(){
 
 detect_tag(){
   local n="$1"
-  [[ "$n" == *LR* ]] && { echo LR; return; }
-  [[ "$n" == *RL* ]] && { echo RL; return; }
-  [[ "$n" == *HF* || "$n" == *AP* ]] && { echo AP; return; }
-  [[ "$n" == *FH* || "$n" == *PA* ]] && { echo PA; return; }
-  echo PA
+
+  [[ "$n" == *LR* ]] && { echo LR; return 0; }
+  [[ "$n" == *RL* ]] && { echo RL; return 0; }
+  [[ "$n" == *HF* || "$n" == *AP* ]] && { echo AP; return 0; }
+  [[ "$n" == *FH* || "$n" == *PA* ]] && { echo PA; return 0; }
+
+  return 1
+}
+
+is_derived_series(){
+  local b
+  b="$(basename "$1")"
+
+  case "$b" in
+    *ADC*|*TRACEW*|*FA*|*ColFA*|*Tensor*|*TENSOR*|*DWIMap*|*Report* )
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 run_prep(){
@@ -136,9 +156,18 @@ run_prep(){
   local out_nii="$2"
 
   if [[ "${V[*]}" == "x y z" && "${R[*]}" == "1 1 1" ]]; then
-    python3 "$PREP_PY" -i "$in_nii" -o "$out_nii" --header-only --hard-fix-header
+    python3 "$PREP_PY" \
+      -i "$in_nii" \
+      -o "$out_nii" \
+      --header-only \
+      --hard-fix-header
   else
-    python3 "$PREP_PY" -i "$in_nii" -o "$out_nii" -v "${V[@]}" -r "${R[@]}" --hard-fix-header
+    python3 "$PREP_PY" \
+      -i "$in_nii" \
+      -o "$out_nii" \
+      -v "${V[@]}" \
+      -r "${R[@]}" \
+      --hard-fix-header
   fi
 }
 
@@ -196,6 +225,32 @@ remove_initial_b0_in_dir(){
   rm -rf "$tmpdir"
 }
 
+convert_series_to_tmp(){
+  local dicom_dir="$1"
+  local tmpdir="$2"
+
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  if ! dcm2niix -z y -o "$tmpdir" "$dicom_dir"; then
+    return 1
+  fi
+
+  find "$tmpdir" -maxdepth 1 -type f -name "*.nii.gz" | sort -V | head -n1
+}
+
+copy_sidecars_if_present(){
+  local in_nii="$1"
+  local out_stem="$2"
+
+  local stem
+  stem="${in_nii%.nii.gz}"
+
+  [ -f "${stem}.bval" ] && cp -f "${stem}.bval" "${out_stem}.bval" || true
+  [ -f "${stem}.bvec" ] && cp -f "${stem}.bvec" "${out_stem}.bvec" || true
+  [ -f "${stem}.json" ] && cp -f "${stem}.json" "${out_stem}.json" || true
+}
+
 # =========================
 # Mode banner
 # =========================
@@ -221,48 +276,71 @@ echo
 # =========================
 if ! $BVEC_ADJUST; then
   rm -rf "$OUT_DIR"
-  mkdir -p "$OUT_DIR"/{AP,PA,AP_ph,PA_ph,T1}
+  mkdir -p "$OUT_DIR"/{AP,PA,LR,RL,AP_ph,PA_ph,LR_ph,RL_ph,T1}
+
+  TMP_CONV_ROOT="$OUT_DIR/.tmp_dcm2niix"
+  mkdir -p "$TMP_CONV_ROOT"
 
   # ---- Diffusion magnitude (exclude 'Pha') ----
   ap=1
   pa=1
+  lr=1
+  rl=1
 
   for d in "$DICOM_DIR"/*"$SRCH"*; do
     [ -d "$d" ] || continue
     [[ "$d" == *Pha* ]] && continue
+
+    if is_derived_series "$d"; then
+      echo "Skipping derived series: $(basename "$d")"
+      continue
+    fi
+
     base="$(basename "$d")"
 
-    dcm2niix -z y -o "$OUT_DIR" "$d"
-    nii="$(latest_nii "$OUT_DIR")"
+    if ! tag="$(detect_tag "$base")"; then
+      echo "Skipping unrecognised series: $base"
+      continue
+    fi
+
+    if $TEST_MODE; then
+      if [[ "$tag" != "AP" || "$ap" -ne 1 ]]; then
+        echo "Skipping $base (test mode: only AP_1)"
+        continue
+      fi
+    fi
+
+    tmpdir="$TMP_CONV_ROOT/${base}"
+    nii="$(convert_series_to_tmp "$d" "$tmpdir")" || {
+      echo "warning: dcm2niix failed for $base"
+      continue
+    }
+
     [ -n "${nii:-}" ] || {
       echo "warning: no NIfTI found after converting $d"
       continue
     }
 
-    tag="$(detect_tag "$base")"
-
     case "$tag" in
       AP)
-        if $TEST_MODE && [ "$ap" -ne 1 ]; then
-          echo "Skipping $base (test mode: only AP_1)"
-          continue
-        fi
         subdir="$OUT_DIR/AP"
         out_stem="${subdir}/AP_${ap}"
         ((ap++))
         ;;
       PA)
-        if $TEST_MODE; then
-          echo "Skipping $base (test mode: only AP_1)"
-          continue
-        fi
         subdir="$OUT_DIR/PA"
         out_stem="${subdir}/PA_${pa}"
         ((pa++))
         ;;
-      LR|RL)
-        echo "ERROR: Detected $tag but only AP/PA outputs are supported."
-        exit 1
+      LR)
+        subdir="$OUT_DIR/LR"
+        out_stem="${subdir}/LR_${lr}"
+        ((lr++))
+        ;;
+      RL)
+        subdir="$OUT_DIR/RL"
+        out_stem="${subdir}/RL_${rl}"
+        ((rl++))
         ;;
       *)
         echo "Unknown tag for $base"
@@ -272,31 +350,42 @@ if ! $BVEC_ADJUST; then
 
     mkdir -p "$subdir"
     run_prep "$nii" "${out_stem}.nii.gz"
-
-    stem="${nii%.nii.gz}"
-    [ -f "${stem}.bval" ] && cp -f "${stem}.bval" "${out_stem}.bval" || true
-    [ -f "${stem}.bvec" ] && cp -f "${stem}.bvec" "${out_stem}.bvec" || true
-    [ -f "${stem}.json" ] && cp -f "${stem}.json" "${out_stem}.json" || true
+    copy_sidecars_if_present "$nii" "$out_stem"
   done
 
   # ---- Diffusion phase (only 'Pha') ----
   if ! $TEST_MODE; then
     ap=1
     pa=1
+    lr=1
+    rl=1
 
     for d in "$DICOM_DIR"/*"$SRCH"*; do
       [ -d "$d" ] || continue
       [[ "$d" != *Pha* ]] && continue
+
+      if is_derived_series "$d"; then
+        echo "Skipping derived phase series: $(basename "$d")"
+        continue
+      fi
+
       base="$(basename "$d")"
 
-      dcm2niix -z y -o "$OUT_DIR" "$d"
-      nii="$(latest_nii "$OUT_DIR")"
+      if ! tag="$(detect_tag "$base")"; then
+        echo "Skipping unrecognised phase series: $base"
+        continue
+      fi
+
+      tmpdir="$TMP_CONV_ROOT/${base}"
+      nii="$(convert_series_to_tmp "$d" "$tmpdir")" || {
+        echo "warning: dcm2niix failed for phase series $base"
+        continue
+      }
+
       [ -n "${nii:-}" ] || {
         echo "warning: no NIfTI found after converting $d"
         continue
       }
-
-      tag="$(detect_tag "$base")"
 
       case "$tag" in
         AP)
@@ -309,9 +398,15 @@ if ! $BVEC_ADJUST; then
           out_stem="${subdir}/PA_${pa}_ph"
           ((pa++))
           ;;
-        LR|RL)
-          echo "ERROR: Detected $tag in phase series but only AP_ph/PA_ph outputs are supported."
-          exit 1
+        LR)
+          subdir="$OUT_DIR/LR_ph"
+          out_stem="${subdir}/LR_${lr}_ph"
+          ((lr++))
+          ;;
+        RL)
+          subdir="$OUT_DIR/RL_ph"
+          out_stem="${subdir}/RL_${rl}_ph"
+          ((rl++))
           ;;
         *)
           echo "Unknown tag for $base"
@@ -336,8 +431,14 @@ if ! $BVEC_ADJUST; then
     for d in "$DICOM_DIR"/*"$SRCH_T1"*; do
       [ -d "$d" ] || continue
 
-      dcm2niix -z y -o "$OUT_DIR" "$d"
-      nii="$(latest_nii "$OUT_DIR")"
+      base="$(basename "$d")"
+      tmpdir="$TMP_CONV_ROOT/${base}"
+
+      nii="$(convert_series_to_tmp "$d" "$tmpdir")" || {
+        echo "warning: dcm2niix failed for T1 series $base"
+        continue
+      }
+
       [ -n "${nii:-}" ] || {
         echo "warning: no NIfTI found after converting $d"
         continue
@@ -356,6 +457,8 @@ if ! $BVEC_ADJUST; then
   else
     echo "Skipping T1 conversion (test mode)"
   fi
+
+  rm -rf "$TMP_CONV_ROOT"
 fi
 
 # =========================
@@ -394,8 +497,7 @@ else
   vf_x="$vx"
   vf_y="$vy"
   vf_z="$vz"
-  # vf_z=$(( -1 * vz ))
-  echo "  FULL RUN: applying Z inversion relative to provided -r."
+  echo "  FULL RUN: applying -vf directly from provided -r."
 fi
 
 echo "  -vr ${vr_args[*]}"
@@ -411,8 +513,12 @@ else
     {
       find "$OUT_DIR/AP"    -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
       find "$OUT_DIR/PA"    -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/LR"    -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/RL"    -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
       find "$OUT_DIR/AP_ph" -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
       find "$OUT_DIR/PA_ph" -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/LR_ph" -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
+      find "$OUT_DIR/RL_ph" -maxdepth 1 -type f -name "*.bvec" -print0 2>/dev/null
     } || true
   )
 fi
@@ -499,8 +605,8 @@ echo
 echo "Done -> $(abs_path "$OUT_DIR")"
 echo "  Mode: $($BVEC_ADJUST && echo 'BVEC-ADJUST' || echo 'FULL')"
 echo "  Test mode:        $TEST_MODE"
-echo "  Diff magnitude:   $OUT_DIR/AP and $OUT_DIR/PA"
-echo "  Diff phase:       $OUT_DIR/AP_ph and $OUT_DIR/PA_ph"
+echo "  Diff magnitude:   $OUT_DIR/AP $OUT_DIR/PA $OUT_DIR/LR $OUT_DIR/RL"
+echo "  Diff phase:       $OUT_DIR/AP_ph $OUT_DIR/PA_ph $OUT_DIR/LR_ph $OUT_DIR/RL_ph"
 echo "  T1:               $OUT_DIR/T1"
 echo "  bvecs flipped with: -vr ${vr_args[*]}  -vf ${vf_x} ${vf_y} ${vf_z}"
 echo "  dtifit sanity outputs: $TESTDIR"
