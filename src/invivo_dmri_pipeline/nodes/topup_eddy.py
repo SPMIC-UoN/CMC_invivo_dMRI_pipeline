@@ -410,7 +410,11 @@ class RunTopupInputSpec(BaseInterfaceInputSpec):
     outdir = Directory(mandatory=True, desc="output directory")
     out_base = traits.Str(mandatory=True, desc="base name for TOPUP outputs")
 
-    bet4animal_z = traits.Int(usedefault=True, default_value=0, desc="if >0, use -Z in BET")
+    bet4animal_z = traits.Int(
+        usedefault=True,
+        default_value=0,
+        desc="bet4animal species label: 0=human, 2=macaque"
+    )
 
 
 class RunTopupOutputSpec(TraitedSpec):
@@ -452,9 +456,20 @@ class RunTopup(BaseInterface):
         _run(["fslmaths", iout, "-Tmean", nodif])
 
         mask_base = os.path.join(outdir, "topup_nodif_brain")
-        bet_cmd = ["bet", nodif, mask_base, "-m", "-f", "0.3"]
-        if int(self.inputs.bet4animal_z) > 0:
-            bet_cmd.append("-Z")
+        bet_species = int(self.inputs.bet4animal_z)
+        if bet_species not in (0, 2):
+            raise RuntimeError(
+                f"Unsupported bet4animal_z value: {bet_species}. "
+                "Expected 0 for human or 2 for macaque."
+            )
+        bet_cmd = [
+            "bet4animal",
+            nodif,
+            mask_base,
+            "-z", str(bet_species),
+            "-m",
+            "-f", "0.3",
+        ]
         _run(bet_cmd)
 
         mask_file = mask_base + "_mask.nii.gz"
