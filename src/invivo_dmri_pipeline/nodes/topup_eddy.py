@@ -12,7 +12,7 @@ from nipype.interfaces.base import (
 )
 
 # Package-local helpers
-from ..utils import FSL
+from ..utils import FSL, pkg_file
 
 
 def _run(cmd: List[str]) -> None:
@@ -289,18 +289,18 @@ class PrepareTopupEddy(BaseInterface):
         d2 = int(subprocess.check_output([fslval, ap_file, "dim2"], text=True).split()[0])
         d3 = int(subprocess.check_output([fslval, ap_file, "dim3"], text=True).split()[0])
 
-        cfg_dir = os.path.join(fsldir, "etc", "flirtsch")
         if (d1 % 4 == 0) and (d2 % 4 == 0) and (d3 % 4 == 0):
-            topup_config = os.path.join(cfg_dir, "b02b0_4.cnf")
+            topup_config = pkg_file("files", "b02b0_UHF_4.cnf")
         elif (d1 % 2 == 0) and (d2 % 2 == 0) and (d3 % 2 == 0):
-            topup_config = os.path.join(cfg_dir, "b02b0_2.cnf")
+            topup_config = pkg_file("files", "b02b0_UHF_2.cnf")
         else:
-            topup_config = os.path.join(cfg_dir, "b02b0_1.cnf")
+            topup_config = pkg_file("files", "b02b0_UHF_1.cnf")
 
         if not os.path.isfile(topup_config):
             raise RuntimeError(f"TOPUP config not found at {topup_config}")
 
-        print(f"[PrepareTopupEddy] Using TOPUP config: {topup_config}")
+        print(f"[PrepareTopupEddy] Image dims: {d1} x {d2} x {d3}")
+        print(f"[PrepareTopupEddy] Using packaged UHF TOPUP config: {topup_config}")
 
         # ------------------------------------------------------------------
         # 3) Build Pos_Neg (AP + PA) and combined sidecars for EDDY
