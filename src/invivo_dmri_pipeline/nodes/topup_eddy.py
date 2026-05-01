@@ -615,6 +615,8 @@ class RunEddy(BaseInterface):
             f"--cnr_maps",
             f"--niter=5",
             f"--fwhm=10,5,0,0,0",
+            f"--repol",
+            f"-v",
         ] + list(extra)
 
         _run_and_stream(cmd)
