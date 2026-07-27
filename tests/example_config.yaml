@@ -1,6 +1,6 @@
 # --- Required ---
-ECHO_MS: 0.403327         # ms
-PIFACTOR: 3
+MODE: nhp
+TOTAL_READOUT_TIME: 0.0403 # seconds
 LOWER_B: 1000
 
 # --- Optional knobs (defaults shown) ---

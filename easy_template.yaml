@@ -7,6 +7,11 @@ dmri_root: /path/to/output_root
 input_root: /path/to/input_root
 denoise_sh: /path/to/denoise_wrapper.sh
 
+# Required processing settings
+MODE: nhp                 # nhp or hum
+TOTAL_READOUT_TIME: 0.0403 # seconds
+LOWER_B: 1000             # shell used for DTI and skullstrip reference
+
 # Optional T1 (recommended if available)
 t1: /path/to/T1.nii.gz
 
@@ -15,9 +20,6 @@ NO_GPU: false            # true disables GPU for bedpostx/xtract
 PTX_STEPLENGTH: 0.15      # xtract / probtrackx step length
 COMBINE_MATCHED_FLAG: 1  # 1 = combine only matching shells across AP/PA
 REMOVE_B0: true          # remove initial b0s before combining
-ECHO_MS: 0.75            # total readout (ms) for topup/eddy
-PIFACTOR: 3              # GRAPPA/SENSE factor in PE
-LOWER_B: 1000            # shell used for DTI and skullstrip reference
 
 # Keep Docker defaults on (works out-of-the-box if you have the images)
 use_docker: true

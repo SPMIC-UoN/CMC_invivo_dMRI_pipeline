@@ -91,11 +91,14 @@ A minimal example illustrates the key fields. Paths may be relative or absolute;
 dmri_root: /path/to/processing/proc
 input_root: /path/to/INPUT_ROOT
 
+# Required processing settings
+MODE: nhp                     # nhp or hum
+TOTAL_READOUT_TIME: 0.0403    # seconds
+LOWER_B: 1000
+
 denoise_sh: /path/to/denoise_wrapper.sh
 
 B0RANGE: 60                  # threshold for identifying b0 volumes
-ECHO_MS: 0.34                # echo spacing (ms)
-PIFACTOR: 3                  # parallel imaging factor (GRAPPA or equivalent)
 
 run_gibbs: true # run Gibbs unringing?
 run_n4: true # run bias field correction?
@@ -103,7 +106,6 @@ use_docker: true
 docker_image: mrtrix3/mrtrix3
 interactive_tty: true
 
-LOWER_B: 1000
 brain_mask: null # option to supply a precomputed brain mask in T1 space
 t1: null # required if providing T1 space brain mask
 
@@ -114,7 +116,8 @@ stdreg_method: mmorf         # mmorf or fnirt
 
 ### Notes on key parameters
 - **`B0RANGE`** defines what counts as b0 when identifying or removing initial volumes and reporting counts.  
-- **`ECHO_MS` and `PIFACTOR`** are used to compute readout time for TOPUP/EDDY acqparams.  
+- **`TOTAL_READOUT_TIME`** is the total acquisition readout time in seconds used in TOPUP/EDDY acqparams.
+- **`MODE`** selects non-human primate (`nhp`) or human (`hum`) defaults.
 - **`eddy_extra_args`** is passed directly to `eddy`. Add `--session` here if you want session-aware modeling. The pipeline will supply `--session=<series_index.txt>` automatically when `--session` is present.  
 - **`COMBINE_MATCHED_FLAG`** controls whether to keep all volumes after EDDY or only matched AP/PA pairs.  
 - **`LOWER_B`** defines the lower shell used for the DTI tensor fit.  
