@@ -1,214 +1,143 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# Merge diffusion runs by PE direction and "ph" flag
-# Produces one merged file set per class:
-#   OUTDIR/AP/AP_1.{nii.gz,bval,bvec}
-#   OUTDIR/AP_ph/AP_1_ph.{nii.gz,bval,bvec}
-#   OUTDIR/PA/PA_1.{nii.gz,bval,bvec}
-#   OUTDIR/PA_ph/PA_1_ph.{nii.gz,bval,bvec}
-# Each directory also includes *_inputs.txt listing merged runs.
-# Includes per-run and post-merge sanity checks.
-# Requires: FSL (fslmerge, fslval), coreutils, awk, paste, sort -V
-# ============================================================
+# Convert human in-vivo DICOM diffusion data for CMC_invivo_dMRI_pipeline.
+# Keeps individual DWI runs so that complex denoising and run-level QC happen
+# before the main pipeline combines AP and PA data.
+#
+# S05 selection:
+#   AP magnitude: MR-SE008, MR-SE012, MR-SE028
+#   AP phase:     MR-SE009, MR-SE013, MR-SE029
+#   PA magnitude: MR-SE019, MR-SE035
+#   PA phase:     MR-SE020, MR-SE036
+# SBRefs, FA/ColFA maps, localizers, B1 maps, and MP2RAGE images are excluded
+# from the diffusion inputs. The MP2RAGE UNI image is copied to T1.
 
 usage() {
-  cat <<EOF
-Usage:
-  $(basename "$0") <INPUT_RAW_DIR> <OUTDIR>
-
-Example:
-  $(basename "$0") ./raw ./merged
-EOF
+    echo "Usage: $(basename "$0") <DICOM_DIR> <OUT_DIR>"
+    exit 2
 }
 
-if [[ $# -ne 2 ]]; then
-  usage
-  exit 2
-fi
+[[ $# -eq 2 ]] || usage
 
-INDIR="$1"
-OUTDIR="$2"
-mkdir -p "$OUTDIR"
+dicomdir="$1"
+outdir="$2"
 
-# Check dependencies
-for dep in fslmerge fslval awk paste sort; do
-  command -v "$dep" >/dev/null 2>&1 || { echo "error: $dep not found in PATH"; exit 2; }
-done
+module load fsl dcm2niix
+
+mkdir -p "${outdir}"/{AP,PA,AP_ph,PA_ph,T1}
+tmpdir="${outdir}/.tmp_dcm2niix"
+mkdir -p "${tmpdir}"
 
 shopt -s nullglob
 
-# Collect candidate NIfTI files
-mapfile -t NII_LIST < <(find "$INDIR" -maxdepth 1 -type f -name '*.nii.gz' | sort -V)
-if [[ ${#NII_LIST[@]} -eq 0 ]]; then
-  echo "error: no .nii.gz files found in $INDIR"
-  exit 2
-fi
-
-# Group containers
-AP_files=(); AP_ph_files=(); PA_files=(); PA_ph_files=()
-
-# ---------- helpers ----------
-
-classify() {
-  local fn="$1"
-  local base="$(basename "$fn")"
-  local dir_tag=""
-  local ph_tag=""
-
-  if [[ "$base" =~ (^|[^A-Za-z])AP([^A-Za-z]|$) ]]; then
-    dir_tag="AP"
-  elif [[ "$base" =~ (^|[^A-Za-z])PA([^A-Za-z]|$) ]]; then
-    dir_tag="PA"
-  else
-    echo "skip"; return
-  fi
-
-  if [[ "$base" =~ (_ph|Pha|PHA|_PH) ]]; then
-    ph_tag="_ph"
-  else
-    ph_tag=""
-  fi
-
-  echo "${dir_tag}${ph_tag}"
+is_derived_or_reference() {
+    local name="$1"
+    [[ "${name}" == *SBRef* || "${name}" == *FA* || "${name}" == *ColFA* || \
+       "${name}" == *ADC* || "${name}" == *TRACE* || "${name}" == *Tensor* ]]
 }
 
-get_dim4() { fslval "$1" dim4; }
-
-count_bvals_entries() { awk '{n+=NF} END{print n+0}' "$1"; }
-
-count_bvecs_cols() {
-  awk '
-    NR==1{n1=NF}
-    NR==2{n2=NF}
-    NR==3{n3=NF}
-    END{
-      if (NR<3){print -1; exit}
-      if (n1!=n2 || n1!=n3){print -2; exit}
-      print n1+0
-    }' "$1"
+direction() {
+    local name="$1"
+    [[ "${name}" =~ (^|[_-])AP([_-]|$) ]] && { echo AP; return; }
+    [[ "${name}" =~ (^|[_-])PA([_-]|$) ]] && { echo PA; return; }
+    return 1
 }
 
-precheck_run() {
-  local nii="$1" bval="$2" bvec="$3"
+convert_run() {
+    local src="$1"
+    local outstem="$2"
+    local name
+    name="$(basename "${src}")"
 
-  [[ -f "$bval" && -f "$bvec" ]] || {
-    echo "error: missing bval/bvec for $(basename "$nii")"
-    exit 2
-  }
+    local work="${tmpdir}/${name}"
+    rm -rf "${work}"
+    mkdir -p "${work}"
 
-  local d4 nb nv
-  d4=$(get_dim4 "$nii")
-  nb=$(count_bvals_entries "$bval")
-  nv=$(count_bvecs_cols "$bvec")
+    dcm2niix -b y -z y -o "${work}" "${src}"
 
-  if [[ "$nv" -lt 0 ]]; then
-    echo "error: malformed bvec file: $bvec"
-    exit 2
-  fi
+    local nii=("${work}"/*.nii.gz)
+    [[ ${#nii[@]} -eq 1 ]] || {
+        echo "error: expected one NIfTI from ${name}, found ${#nii[@]}"
+        exit 1
+    }
 
-  if [[ "$d4" -ne "$nb" || "$d4" -ne "$nv" ]]; then
-    echo "error: volume mismatch for $(basename "$nii")"
-    echo "  NIfTI dim4=$d4, bval=$nb, bvec=$nv"
-    exit 2
-  fi
+    local stem="${nii[0]%.nii.gz}"
+    cp "${nii[0]}" "${outstem}.nii.gz"
+    [[ -f "${stem}.json" ]] && cp "${stem}.json" "${outstem}.json"
+    [[ -f "${stem}.bval" ]] && cp "${stem}.bval" "${outstem}.bval"
+    [[ -f "${stem}.bvec" ]] && cp "${stem}.bvec" "${outstem}.bvec"
 }
 
-merge_niftis() {
-  local out="$1"; shift
-  local -a inputs=("$@")
-  mapfile -t inputs < <(printf '%s\n' "${inputs[@]}" | sort -V)
-  [[ ${#inputs[@]} -eq 1 ]] && cp -f "${inputs[0]}" "$out" || fslmerge -t "$out" "${inputs[@]}"
+check_dwi() {
+    local stem="$1"
+    local nvol nbval nbvec
+    nvol="$(fslval "${stem}.nii.gz" dim4)"
+    nbval="$(awk '{n += NF} END {print n}' "${stem}.bval")"
+    nbvec="$(awk 'NR <= 3 {n = NF} END {print n}' "${stem}.bvec")"
+    [[ "${nvol}" -eq "${nbval}" && "${nvol}" -eq "${nbvec}" ]] || {
+        echo "error: NIfTI/bval/bvec mismatch for ${stem}"
+        exit 1
+    }
 }
 
-merge_bvals() {
-  local out="$1"; shift
-  awk '{for(i=1;i<=NF;i++) printf "%s ", $i} END{print ""}' "$@" | awk '{$1=$1;print}' > "$out"
+check_phase_match() {
+    local magn="$1" phase="$2"
+    [[ "$(fslval "${magn}.nii.gz" dim4)" -eq "$(fslval "${phase}.nii.gz" dim4)" ]] || {
+        echo "error: magnitude/phase volume mismatch: ${magn} ${phase}"
+        exit 1
+    }
 }
 
-merge_bvecs() {
-  local out="$1"; shift
-  paste -d ' ' "$@" | awk '{$1=$1;print}' > "$out"
-}
+ap_mag=()
+pa_mag=()
+ap_ph=()
+pa_ph=()
 
-postcheck_group() {
-  local label="$1" nii="$2" bval="$3" bvec="$4"
-  local d4 nb nv
-  d4=$(get_dim4 "$nii")
-  nb=$(count_bvals_entries "$bval")
-  nv=$(count_bvecs_cols "$bvec")
-  if [[ "$nv" -lt 0 ]]; then echo "error: malformed merged bvec ($bvec)"; exit 2; fi
-  if [[ "$d4" -ne "$nb" || "$d4" -ne "$nv" ]]; then
-    echo "error: ${label} mismatch after merge (dim4=$d4, bval=$nb, bvec=$nv)"
-    exit 2
-  fi
-  echo "OK: ${label} volumes match (dim4=$d4)"
-}
+for series in "${dicomdir}"/MR-SE*diff*; do
+    [[ -d "${series}" ]] || continue
+    name="$(basename "${series}")"
 
-report_group() {
-  local name="$1"; shift
-  local -a files=("$@")
-  echo "Found ${#files[@]} runs for ${name}"
-  for f in "${files[@]}"; do echo "  - $f"; done
-}
+    is_derived_or_reference "${name}" && continue
+    pe="$(direction "${name}")" || continue
 
-do_group() {
-  local label="$1" subdir="$2" prefix="$3"
-  shift 3
-  local -a nii_files=("$@")
-  [[ ${#nii_files[@]} -eq 0 ]] && return
-
-  mkdir -p "${OUTDIR}/${subdir}"
-  local out_nii="${OUTDIR}/${subdir}/${prefix}.nii.gz"
-  local out_bval="${OUTDIR}/${subdir}/${prefix}.bval"
-  local out_bvec="${OUTDIR}/${subdir}/${prefix}.bvec"
-
-  # Build sidecar arrays + sanity checks
-  local bval_files=() bvec_files=()
-  for nii in "${nii_files[@]}"; do
-    local stem="${nii%.nii.gz}"
-    local bval="${stem}.bval"
-    local bvec="${stem}.bvec"
-    precheck_run "$nii" "$bval" "$bvec"
-    bval_files+=("$bval")
-    bvec_files+=("$bvec")
-  done
-
-  echo "Merging ${label} -> ${out_nii}"
-  merge_niftis "$out_nii" "${nii_files[@]}"
-  merge_bvals  "$out_bval" "${bval_files[@]}"
-  merge_bvecs  "$out_bvec" "${bvec_files[@]}"
-  postcheck_group "$label" "$out_nii" "$out_bval" "$out_bvec"
-
-  {
-    echo "# Inputs merged into ${prefix}"
-    printf '%s\n' "${nii_files[@]}"
-  } > "${OUTDIR}/${subdir}/${prefix}_inputs.txt"
-}
-
-# ---------- classify files ----------
-for nii in "${NII_LIST[@]}"; do
-  key=$(classify "$nii")
-  [[ "$key" == "skip" ]] && { echo "warn: skipping $(basename "$nii")"; continue; }
-  case "$key" in
-    AP)     AP_files+=("$nii") ;;
-    AP_ph)  AP_ph_files+=("$nii") ;;
-    PA)     PA_files+=("$nii") ;;
-    PA_ph)  PA_ph_files+=("$nii") ;;
-  esac
+    if [[ "${name}" == *Pha* ]]; then
+        [[ "${pe}" == AP ]] && ap_ph+=("${series}") || pa_ph+=("${series}")
+    else
+        [[ "${pe}" == AP ]] && ap_mag+=("${series}") || pa_mag+=("${series}")
+    fi
 done
 
-# ---------- report ----------
-report_group "AP"     "${AP_files[@]}"
-report_group "AP_ph"  "${AP_ph_files[@]}"
-report_group "PA"     "${PA_files[@]}"
-report_group "PA_ph"  "${PA_ph_files[@]}"
+printf 'AP magnitude runs: %s\n' "${#ap_mag[@]}"
+printf 'AP phase runs:     %s\n' "${#ap_ph[@]}"
+printf 'PA magnitude runs: %s\n' "${#pa_mag[@]}"
+printf 'PA phase runs:     %s\n' "${#pa_ph[@]}"
 
-# ---------- merge ----------
-do_group "AP"    "AP"    "AP_1"     "${AP_files[@]}"
-do_group "AP_ph" "AP_ph" "AP_1_ph"  "${AP_ph_files[@]}"
-do_group "PA"    "PA"    "PA_1"     "${PA_files[@]}"
-do_group "PA_ph" "PA_ph" "PA_1_ph"  "${PA_ph_files[@]}"
+[[ ${#ap_mag[@]} -eq ${#ap_ph[@]} ]] || { echo "error: AP magnitude/phase counts differ"; exit 1; }
+[[ ${#pa_mag[@]} -eq ${#pa_ph[@]} ]] || { echo "error: PA magnitude/phase counts differ"; exit 1; }
 
-echo "Done. Outputs written under: $OUTDIR"
+for i in "${!ap_mag[@]}"; do
+    n=$((i + 1))
+    convert_run "${ap_mag[i]}" "${outdir}/AP/AP_${n}"
+    convert_run "${ap_ph[i]}" "${outdir}/AP_ph/AP_${n}_ph"
+    check_dwi "${outdir}/AP/AP_${n}"
+    check_phase_match "${outdir}/AP/AP_${n}" "${outdir}/AP_ph/AP_${n}_ph"
+done
+
+for i in "${!pa_mag[@]}"; do
+    n=$((i + 1))
+    convert_run "${pa_mag[i]}" "${outdir}/PA/PA_${n}"
+    convert_run "${pa_ph[i]}" "${outdir}/PA_ph/PA_${n}_ph"
+    check_dwi "${outdir}/PA/PA_${n}"
+    check_phase_match "${outdir}/PA/PA_${n}" "${outdir}/PA_ph/PA_${n}_ph"
+done
+
+# Retain the MP2RAGE UNI image for later masking/registration.
+t1=("${dicomdir}"/MR-SE*t1_mp2rage*UNI_Images*)
+if [[ ${#t1[@]} -eq 1 ]]; then
+    convert_run "${t1[0]}" "${outdir}/T1/T1_1"
+else
+    echo "warning: expected one MP2RAGE UNI_Images series, found ${#t1[@]}"
+fi
+
+echo "Done: ${outdir}"
