@@ -6,12 +6,12 @@ set -euo pipefail
 # before the main pipeline combines AP and PA data.
 #
 # S05 selection:
-#   AP magnitude: MR-SE008, MR-SE012, MR-SE028
-#   AP phase:     MR-SE009, MR-SE013, MR-SE029
+#   AP magnitude: MR-SE012, MR-SE028
+#   AP phase:     MR-SE013, MR-SE029
 #   PA magnitude: MR-SE019, MR-SE035
 #   PA phase:     MR-SE020, MR-SE036
 # SBRefs, FA/ColFA maps, localizers, B1 maps, and MP2RAGE images are excluded
-# from the diffusion inputs. The MP2RAGE UNI image is copied to T1.
+# from the diffusion inputs. The MP2RAGE INV2 image is copied to T1_2.
 
 usage() {
     echo "Usage: $(basename "$0") <DICOM_DIR> <OUT_DIR>"
@@ -35,6 +35,12 @@ is_derived_or_reference() {
     local name="$1"
     [[ "${name}" == *SBRef* || "${name}" == *FA* || "${name}" == *ColFA* || \
        "${name}" == *ADC* || "${name}" == *TRACE* || "${name}" == *Tensor* ]]
+}
+
+is_faulty_s05_run() {
+    local name="$1"
+    [[ "$(basename "${outdir}")" == pt89_diff_S05 && \
+       ( "${name}" == MR-SE008-* || "${name}" == MR-SE009-* ) ]]
 }
 
 direction() {
@@ -98,6 +104,7 @@ for series in "${dicomdir}"/MR-SE*diff*; do
     [[ -d "${series}" ]] || continue
     name="$(basename "${series}")"
 
+    is_faulty_s05_run "${name}" && continue
     is_derived_or_reference "${name}" && continue
     pe="$(direction "${name}")" || continue
 
@@ -116,28 +123,36 @@ printf 'PA phase runs:     %s\n' "${#pa_ph[@]}"
 [[ ${#ap_mag[@]} -eq ${#ap_ph[@]} ]] || { echo "error: AP magnitude/phase counts differ"; exit 1; }
 [[ ${#pa_mag[@]} -eq ${#pa_ph[@]} ]] || { echo "error: PA magnitude/phase counts differ"; exit 1; }
 
+# The pipeline discovers phase files as AP_ph_*.nii.gz / PA_ph_*.nii.gz.
 for i in "${!ap_mag[@]}"; do
     n=$((i + 1))
     convert_run "${ap_mag[i]}" "${outdir}/AP/AP_${n}"
-    convert_run "${ap_ph[i]}" "${outdir}/AP_ph/AP_${n}_ph"
+    convert_run "${ap_ph[i]}" "${outdir}/AP_ph/AP_ph_${n}"
     check_dwi "${outdir}/AP/AP_${n}"
-    check_phase_match "${outdir}/AP/AP_${n}" "${outdir}/AP_ph/AP_${n}_ph"
+    check_phase_match "${outdir}/AP/AP_${n}" "${outdir}/AP_ph/AP_ph_${n}"
 done
 
 for i in "${!pa_mag[@]}"; do
     n=$((i + 1))
     convert_run "${pa_mag[i]}" "${outdir}/PA/PA_${n}"
-    convert_run "${pa_ph[i]}" "${outdir}/PA_ph/PA_${n}_ph"
+    convert_run "${pa_ph[i]}" "${outdir}/PA_ph/PA_ph_${n}"
     check_dwi "${outdir}/PA/PA_${n}"
-    check_phase_match "${outdir}/PA/PA_${n}" "${outdir}/PA_ph/PA_${n}_ph"
+    check_phase_match "${outdir}/PA/PA_${n}" "${outdir}/PA_ph/PA_ph_${n}"
 done
 
-# Retain the MP2RAGE UNI image for later masking/registration.
-t1=("${dicomdir}"/MR-SE*t1_mp2rage*UNI_Images*)
+# Retain MP2RAGE INV2 for later masking/registration.
+t1=("${dicomdir}"/MR-SE*t1_mp2rage*INV2*)
 if [[ ${#t1[@]} -eq 1 ]]; then
-    convert_run "${t1[0]}" "${outdir}/T1/T1_1"
+    convert_run "${t1[0]}" "${outdir}/T1/T1_2"
+    bet2 "${outdir}/T1/T1_2.nii.gz" "${outdir}/T1/T1_2_brain" -R -m -f 0.5
 else
-    echo "warning: expected one MP2RAGE UNI_Images series, found ${#t1[@]}"
+    echo "warning: expected one MP2RAGE INV2 series, found ${#t1[@]}"
 fi
+
+# Fast visual sanity check of the AP_1 b-vector orientation.
+testdir="${outdir}/test_dtifit"
+mkdir -p "${testdir}"
+fslmaths "${outdir}/AP/AP_1.nii.gz" -Tmean -mul 0 -add 1 -bin "${testdir}/all_voxels_mask"
+dtifit -k "${outdir}/AP/AP_1.nii.gz" -o "${testdir}/dti_AP_1" -m "${testdir}/all_voxels_mask" -r "${outdir}/AP/AP_1.bvec" -b "${outdir}/AP/AP_1.bval" --sse
 
 echo "Done: ${outdir}"
