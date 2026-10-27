@@ -256,7 +256,7 @@ class QAReport(SimpleInterface):
 
 
 class _Composer:
-    REPORT_VERSION = "2026-10-27.1"
+    REPORT_VERSION = "2026-10-27.2"
 
     def __init__(self, root, outdir, run_mode, supplied):
         self.root = root
@@ -273,6 +273,10 @@ class _Composer:
         self.raw_runs = {}
         self.phase_runs = {}
         self.steps = []
+        self.shell_average_process = None
+        self.shell_average_specs = []
+        self.shell_average_temps = []
+        self.shell_average_error = None
 
     def issue(self, severity, title, detail):
         self.issues.append({"severity": severity, "title": title, "detail": str(detail)})
@@ -287,6 +291,7 @@ class _Composer:
 
     def themed_figure(self, section, stem, title, caption, render, sources=()):
         names = {}
+        failures = defaultdict(list)
         for theme in THEMES:
             path = self.figures / f"{stem}_{theme}.png"
             try:
@@ -295,7 +300,14 @@ class _Composer:
                     raise RuntimeError("rendering did not create a PNG")
                 names[theme] = path.name
             except Exception as exc:
-                self.issue("warning", f"Could not render {title} ({theme})", exc)
+                failures[str(exc)].append(theme)
+        if failures:
+            # Report a failed stage once, rather than one alert per colour theme.
+            details = [message if len(themes) == len(THEMES)
+                       else f"{', '.join(themes)}: {message}"
+                       for message, themes in failures.items()]
+            self.issue("warning", f"Could not fully render {title}",
+                       "; ".join(details))
         if names:
             section["figures"].append({"title": title, "caption": caption,
                                        "light": names.get("light") or names.get("dark"),
@@ -449,14 +461,15 @@ class _Composer:
         self._phase_audit()
         self._step_status()
         self._audit_failures()
+        self._start_final_shell_averages()
         self._denoising()
-        self._final_shell_averages()
         self._topup()
         self._eddy()
         self._mask()
         self._diffusion_maps()
         self._registration()
         self._xtract()
+        self._final_shell_averages()
         paths = self._write_reports()
         return paths
 
@@ -516,41 +529,77 @@ class _Composer:
         if not section["figures"]:
             section["notes"].append("No complete raw/denoised run with usable b-values was found.")
 
-    def _final_shell_averages(self):
-        section = self.section(
-            "final-shells", "Final distortion-corrected shell averages",
-            "Shell averages are calculated only from the final denoised, motion- and "
-            "distortion-corrected data. Raw acquisitions are not averaged for QA.")
+    def _start_final_shell_averages(self):
+        """Start reusable FSL shell means while the remaining QA panels render."""
         data_path = self._source("final_corrected_data", self.supplied["data_4d"],
                                  self.root / "data" / "data.nii.gz")
         bvals_path = self._source("final_corrected_bvals", self.supplied["bvals"],
                                   self.root / "data" / "bvals")
         values = _bvals(bvals_path)
         if not data_path or values is None:
-            section["notes"].append("Final corrected data or b-values were unavailable.")
+            self.shell_average_error = "Final corrected data or b-values were unavailable."
             return
         try:
-            image = nib.load(str(data_path))
-            if len(image.shape) != 4 or image.shape[3] != len(values):
-                raise ValueError(f"data shape={image.shape}, b-values={len(values)}")
+            shape = nib.load(str(data_path)).shape
+            if len(shape) != 4 or shape[3] != len(values):
+                raise ValueError(f"data shape={shape}, b-values={len(values)}")
         except Exception as exc:
-            self.issue("error", "Final shell averaging unavailable", exc)
-            section["notes"].append("Final data and b-value dimensions were inconsistent.")
+            self.shell_average_error = str(exc)
             return
+        output_dir = self.outdir / "shell_averages"
+        output_dir.mkdir(parents=True, exist_ok=True)
         tolerance = float(self.config.get("b0range", 60))
-        cache = {}
+        commands = []
+        select = shutil.which("fslselectvols")
+        maths = shutil.which("fslmaths")
         for shell, indices in sorted(_shell_groups(values, tolerance).items()):
-            def render(path, theme, shell=shell, indices=indices):
-                if shell not in cache:
-                    cache[shell] = _mean_volume(data_path, indices)
-                average = cache[shell]
+            mean_path = output_dir / f"b{shell}_mean.nii.gz"
+            self.shell_average_specs.append((shell, indices, mean_path))
+            if mean_path.is_file():
+                continue
+            if not select or not maths:
+                self.shell_average_error = "fslselectvols or fslmaths was not found on PATH."
+                continue
+            selected = output_dir / f".b{shell}_selected.nii.gz"
+            self.shell_average_temps.append(selected)
+            commands.append(shlex.join([select, "-i", str(data_path), "-o", str(selected),
+                                         "--vols=" + ",".join(map(str, indices))]))
+            commands.append(shlex.join([maths, str(selected), "-Tmean", str(mean_path)]))
+        if commands:
+            self.shell_average_process = subprocess.Popen(
+                ["bash", "-c", " && ".join(commands)], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+
+    def _final_shell_averages(self):
+        section = self.section(
+            "final-shells", "Final distortion-corrected shell averages",
+            "Shell averages are calculated only from the final denoised, motion- and "
+            "distortion-corrected data. FSL means are saved in QA/shell_averages for "
+            "reuse; raw acquisitions are not averaged for QA.")
+        if self.shell_average_process:
+            _, stderr = self.shell_average_process.communicate()
+            if self.shell_average_process.returncode:
+                self.shell_average_error = stderr.strip() or "FSL shell averaging failed."
+        for temporary in self.shell_average_temps:
+            temporary.unlink(missing_ok=True)
+        if self.shell_average_error:
+            self.issue("warning", "Final shell averaging unavailable", self.shell_average_error)
+        if not self.shell_average_specs:
+            section["notes"].append(self.shell_average_error or "No diffusion shells were found.")
+            return
+        for shell, indices, mean_path in self.shell_average_specs:
+            if not mean_path.is_file():
+                section["notes"].append(f"The b={shell} mean was not generated.")
+                continue
+            def render(path, theme, shell=shell, mean_path=mean_path):
+                average = _volume(mean_path)[0]
                 _montage([(f"b={shell} mean", average)],
                          f"Final corrected shell average: b={shell}", path,
                          vmax=_scale((average,)), theme=theme)
             self.figure(
                 section, f"final_shell_b{shell}", f"Final b={shell} shell average",
                 f"Mean of {len(indices)} final corrected volumes in the b={shell} shell.",
-                render, (data_path, bvals_path))
+                render, (mean_path,))
 
     @staticmethod
     def _denoise_panel(raw, den, indices, title, path, theme):
@@ -904,10 +953,11 @@ class _Composer:
                     "direction and FA modulates brightness.", render, (fa, md, v1))
 
     def _registration(self):
+        threshold = 0.1 if self.mode == "hum" else 0.2
         section = self.section(
             "registration", "Standard-space registration",
             "The subject FA transformed to standard space is shown with a red "
-            "outline from standard-space white-matter FA (>0.2). The outline must "
+            f"outline from standard-space white-matter FA (>{threshold:g}). The outline must "
             "come from the template, not from the subject FA itself.")
         transformed = self._source("fa_standard", self.root / "stdreg" / "FA_in_STD.nii.gz")
         reference = self._source("fa_standard_template", self.supplied["nmt_fa_img"])
@@ -918,22 +968,22 @@ class _Composer:
             return
 
         def render(path, theme):
-            self._registration_fsleyes(transformed, reference, path)
+            self._registration_fsleyes(transformed, reference, path, threshold)
 
         self.figure(section, "standard_fa_overlay", "FA in standard space",
-                    "The red contour is template white matter (FA > 0.2). "
+                    f"The red contour is template white matter (FA > {threshold:g}). "
                     "Inspect cortical, callosal and cerebellar alignment.",
                     render, (transformed, reference))
 
     @staticmethod
-    def _registration_fsleyes(subject, reference, output):
-        """Render subject FA with a true template-derived FA>0.2 outline."""
+    def _registration_fsleyes(subject, reference, output, threshold):
+        """Render subject FA with a true template-derived FA outline."""
         executable = shutil.which("fsleyes")
         if not executable:
             raise FileNotFoundError("fsleyes was not found on PATH")
         ref_img = nib.load(str(reference))
         ref_data = np.asarray(ref_img.dataobj)
-        coords = np.argwhere(np.isfinite(ref_data) & (ref_data > 0.2))
+        coords = np.argwhere(np.isfinite(ref_data) & (ref_data > threshold))
         centre = coords.mean(axis=0) if coords.size else np.asarray(ref_img.shape[:3]) / 2
         world = nib.affines.apply_affine(ref_img.affine, centre)
         if coords.size:
@@ -949,7 +999,7 @@ class _Composer:
             midline = float((world_x.min() + world_x.max()) / 2)
             world[0] = (lateral + midline) / 2
         command = [
-            executable, "render", "--outfile", str(output), "--size", "2400", "900",
+            executable, "render", "--outfile", str(output), "--size", "3000", "900",
             "--scene", "ortho", "--worldLoc", *(f"{value:.8f}" for value in world),
             "--displaySpace", str(reference),
             "--xzoom", "100", "--yzoom", "100", "--zzoom", "100",
@@ -960,7 +1010,7 @@ class _Composer:
             "--interpolation", "none", "--volume", "0",
             str(reference), "--name", "Template_FA", "--overlayType", "mask",
             "--alpha", "100", "--maskColour", "1", "0", "0", "--maskInvert",
-            "--threshold", "0", "0.2", "--outline", "--outlineWidth", "3",
+            "--threshold", "0", str(threshold), "--outline", "--outlineWidth", "3",
             "--interpolation", "none", "--volume", "0",
         ]
         subprocess.run(command, check=True, stdout=subprocess.PIPE,
@@ -977,32 +1027,51 @@ class _Composer:
         xdir = Path(self.supplied["xtract_dir"] or self.root / "xtract")
         tracts = sorted((xdir / "tracts").glob("*/densityNorm.nii.gz"))
         self.sources["xtract_tract_count"] = len(tracts)
-        viewer = [xdir / name for name in ("xtract_sagittal.png", "xtract_coronal.png",
-                                           "xtract_axial.png")]
-        for view in viewer:
-            if not view.is_file():
+        waytotals = {}
+        missing_waytotals = []
+        for tract_dir in sorted((xdir / "tracts").glob("*")):
+            if not tract_dir.is_dir():
                 continue
-            output = self.figures / view.name
+            path = tract_dir / "waytotal"
             try:
-                shutil.copy2(view, output)
-                section["figures"].append({
-                    "title": view.stem.replace("xtract_", "").title() + " tracts",
-                    "caption": "XTRACT viewer overlay of selected standard-space tracts.",
-                    "light": output.name, "dark": output.name,
-                    "sources": [str(view)]})
-            except Exception as exc:
-                self.issue("warning", f"Could not include {view.name}", exc)
-        if section["figures"]:
-            section["notes"].append(f"Found {len(tracts)} normalised tract-density files.")
-            return
+                waytotals[tract_dir.name] = float(path.read_text().split()[0])
+            except Exception:
+                missing_waytotals.append(tract_dir.name)
+        self.sources["xtract_waytotal_count"] = len(waytotals)
+        failed = sorted(name for name, value in waytotals.items() if value == 0)
+        low = sorted(((name, value) for name, value in waytotals.items()
+                      if 0 < value < 1000), key=lambda item: item[1])
+        if failed:
+            self.issue("error", "XTRACT tract failure",
+                       "Zero waytotal: " + ", ".join(failed))
+        if low:
+            self.issue("warning", "Very low XTRACT waytotals",
+                       ", ".join(f"{name}={value:g}" for name, value in low))
+        if missing_waytotals:
+            self.issue("warning", "XTRACT waytotals incomplete",
+                       "Missing or unreadable: " + ", ".join(missing_waytotals))
+        if waytotals:
+            self.figure(section, "xtract_waytotals", "XTRACT waytotal check",
+                        "All tract waytotals on a logarithmic scale. Zero means a failed "
+                        "tract; positive values below 1,000 are flagged as very low.",
+                        lambda path, theme: self._xtract_waytotal_panel(waytotals, path, theme),
+                        [xdir / "tracts" / name / "waytotal" for name in waytotals])
         if tracts:
-            section["notes"].append(
-                "Viewer PNGs were unavailable; a density-map overview was rendered instead.")
-            self.figure(section, "xtract_density_overview", "Major tract densities",
-                        "Maximum-intensity projections of representative tract densities "
-                        "in standard space. Colors distinguish tracts, not direction.",
-                        lambda path, theme: self._xtract_density_panel(tracts, path, theme),
-                        tracts[:8])
+            tract_map = {path.parent.name: path for path in tracts}
+            for view in ("sagittal", "coronal", "axial"):
+                selected = [tract_map[name] for name, *_ in self._xtract_view_spec(view)
+                            if name in tract_map]
+                missing = [name for name, *_ in self._xtract_view_spec(view)
+                           if name not in tract_map]
+                if missing:
+                    section["notes"].append(
+                        f"{view.title()} XTRACT panel omitted missing tracts: {', '.join(missing)}.")
+                self.figure(section, f"xtract_{view}", f"XTRACT {view} view",
+                            "Targeted standard-space tract-density MIPs on the standard FA "
+                            "template; the slice location is derived from template anatomy.",
+                            lambda path, theme, view=view, tract_map=tract_map:
+                                self._xtract_fsleyes(view, tract_map, path),
+                            [self.supplied["nmt_fa_img"], *selected])
         elif self.run_mode == "preproc_only":
             section["notes"].append("XTRACT was not requested in this preprocessing-only run.")
         else:
@@ -1011,44 +1080,92 @@ class _Composer:
             section["notes"].append("No XTRACT tract-density files or viewer PNGs were found.")
 
     @staticmethod
-    def _xtract_density_panel(tracts, output, theme):
-        preferred = ("cst_l", "cst_r", "atr_l", "atr_r", "fma", "fmi", "fx_l", "fx_r")
-        selected = sorted(tracts, key=lambda p: (preferred.index(p.parent.name)
-                          if p.parent.name in preferred else 999, p.parent.name))[:8]
-        palette = np.array([[0.38, 0.65, 1], [1, 0.72, 0.25], [0.21, 0.82, 0.61],
-                            [0.97, 0.43, 0.48], [0.68, 0.55, 0.96], [0.99, 0.62, 0.35],
-                            [0.30, 0.79, 0.89], [0.93, 0.49, 0.80]])
-        reference = nib.load(str(selected[0]))
-        rgb = None
-        for i, path in enumerate(selected):
-            aligned = _match_grid(nib.load(str(path)), reference)
-            data = _canon(np.asarray(aligned.dataobj), aligned.affine)
-            nonzero = data[data > 0]
-            if nonzero.size == 0:
-                continue
-            level = float(np.percentile(nonzero, 99)) or 1.0
-            norm = np.clip(data / level, 0, 1)[..., None]
-            if rgb is None:
-                rgb = np.zeros(data.shape + (3,), dtype=np.float32)
-            rgb = np.maximum(rgb, norm * palette[i])
-        if rgb is None:
-            raise ValueError("All XTRACT tract-density maps were empty")
+    def _xtract_waytotal_panel(waytotals, output, theme):
+        ordered = sorted(waytotals.items(), key=lambda item: item[1])
+        names = [item[0] for item in ordered]
+        values = np.asarray([item[1] for item in ordered], dtype=float)
+        shown = np.maximum(values, 0.5)
+        t = THEMES[theme]
         with plt.rc_context(_figure_rc(theme)):
-            fig, axes = plt.subplots(1, 3, figsize=(16, 5.5), layout="constrained")
-            fig.suptitle("XTRACT: representative tract-density projections",
-                         fontsize=18, weight="semibold")
-            projections = (np.max(rgb, axis=0), np.max(rgb, axis=1), np.max(rgb, axis=2))
-            for axis, title, image in zip(axes, ("Sagittal", "Coronal", "Axial"), projections):
-                axis.imshow(np.rot90(image), interpolation="nearest")
-                axis.set_title(title)
-                axis.axis("off")
-            from matplotlib.patches import Patch
-            fig.legend([Patch(color=palette[i], label=path.parent.name)
-                        for i, path in enumerate(selected)],
-                       loc="lower center", ncol=4, frameon=False,
-                       labelcolor=THEMES[theme]["fg"])
-            fig.savefig(output, dpi=170, facecolor=THEMES[theme]["bg"])
+            fig, axis = plt.subplots(figsize=(15, max(8, len(names) * 0.22)),
+                                     layout="constrained")
+            colors = [t["red"] if value == 0 else t["amber"] if value < 1000
+                      else t["blue"] for value in values]
+            axis.barh(range(len(names)), shown, color=colors)
+            axis.set_yticks(range(len(names)), names, fontsize=7)
+            axis.invert_yaxis()
+            axis.set_xscale("log")
+            axis.axvline(1000, color=t["amber"], linestyle="--", linewidth=1)
+            axis.set_xlabel("waytotal (log scale; zeros displayed at 0.5)")
+            axis.set_title("XTRACT waytotal check", loc="left", fontsize=18,
+                           weight="semibold")
+            axis.grid(axis="x", color=t["grid"], linewidth=0.7)
+            fig.savefig(output, dpi=170, facecolor=t["bg"])
             plt.close(fig)
+
+    @staticmethod
+    def _xtract_view_spec(view):
+        return {
+            "sagittal": (
+                ("mcp", "red", .001, .05), ("slf1_r", "green", .005, .03),
+                ("cbd_r", "blue", .003, .02), ("cbp_r", "yellow", .01, .2),
+                ("cst_r", "fsleyes_hot", .003, .07),
+                ("cbt_r", "blue-lightblue", .004, .1),
+                ("fx_r", "fsleyes_copper", .005, .15),
+                ("vof_r", "fsleyes_cool", .005, .05)),
+            "coronal": (
+                ("fx_r", "fsleyes_copper", .005, .1),
+                ("fx_l", "fsleyes_copper", .005, .1),
+                ("cst_r", "fsleyes_hot", .001, .05),
+                ("cst_l", "fsleyes_hot", .001, .05),
+                ("fa_l", "fsleyes_cool", .001, .02),
+                ("fa_r", "fsleyes_cool", .001, .02),
+                ("str_r", "blue", .004, .025), ("str_l", "blue", .004, .025),
+                ("ar_r", "yellow", .02, .1), ("ar_l", "yellow", .02, .1)),
+            "axial": (
+                ("fma", "yellow", .005, .04), ("fmi", "yellow", .002, .01),
+                ("or_l", "blue", .006, .05), ("or_r", "blue", .006, .05),
+                ("ac", "green", .001, .1),
+                ("uf_l", "blue-lightblue", .003, .02),
+                ("uf_r", "blue-lightblue", .003, .02),
+                ("atr_r", "fsleyes_cool", .005, .03),
+                ("atr_l", "fsleyes_cool", .005, .03)),
+        }[view]
+
+    def _xtract_fsleyes(self, view, tract_map, output):
+        executable = shutil.which("fsleyes")
+        if not executable:
+            raise FileNotFoundError("fsleyes was not found on PATH")
+        reference = self._source("xtract_standard_template", self.supplied["nmt_fa_img"])
+        if not reference:
+            raise FileNotFoundError("The standard-space FA template was unavailable")
+        ref_img = nib.load(str(reference))
+        ref_data = np.asarray(ref_img.dataobj)
+        coords = np.argwhere(np.isfinite(ref_data) & (ref_data > 0.1))
+        centre = coords.mean(axis=0) if coords.size else np.asarray(ref_img.shape[:3]) / 2
+        world = nib.affines.apply_affine(ref_img.affine, centre)
+        if view == "sagittal" and coords.size:
+            world_points = nib.affines.apply_affine(ref_img.affine, coords)
+            world[0] = (world[0] + float(world_points[:, 0].max())) / 2
+        hidden = {"sagittal": ("--hidey", "--hidez"),
+                  "coronal": ("--hidex", "--hidez"),
+                  "axial": ("--hidex", "--hidey")}[view]
+        command = [executable, "render", "--outfile", str(output), "--size", "1400", "1000",
+                   "--scene", "ortho", "--worldLoc", *(f"{value:.8f}" for value in world),
+                   "--displaySpace", str(reference), "--xzoom", "100", "--yzoom", "100",
+                   "--zzoom", "100", *hidden, "--hideLabels", "--showLocation", "no",
+                   "--hideCursor", str(reference),
+                   "--name", "Standard_FA", "--overlayType", "volume", "--cmap",
+                   "greyscale", "--brightness", "58", "--contrast", "65",
+                   "--displayRange", "0", "0.5", "--interpolation", "spline"]
+        for name, cmap, low, high in self._xtract_view_spec(view):
+            tract = tract_map.get(name)
+            if tract:
+                command += [str(tract), "--name", name, "--overlayType", "mip",
+                            "--cmap", cmap, "--displayRange", str(low), str(high),
+                            "--interpolation", "spline"]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
 
     def _write_reports(self):
         html_path = self.outdir / "CMC_invivo_QA.html"
