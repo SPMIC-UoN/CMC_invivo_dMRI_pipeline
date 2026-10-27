@@ -775,14 +775,22 @@ class _Composer:
         t = THEMES[theme]
         labels = ["b0 SNR"] + [f"b={shell} CNR" for shell in shells]
         rows = len(values)
+        numeric_maps = [qc_dir / f"cnr{i:04d}.nii.gz" for i in range(rows)]
+        use_numeric_maps = all(path.is_file() for path in numeric_maps)
         with plt.rc_context(_figure_rc(theme)):
-            fig, axes = plt.subplots(rows, 3, figsize=(15, max(6, rows * 3.45)),
-                                     squeeze=False, layout="constrained")
+            if use_numeric_maps:
+                fig, axes = plt.subplots(rows, 3, figsize=(15, max(6, rows * 3.45)),
+                                         squeeze=False, layout="constrained")
+            else:
+                compact_rows = (rows + 1) // 2
+                fig, axes = plt.subplots(compact_rows, 2,
+                                         figsize=(15, max(5.5, compact_rows * 4.2)),
+                                         squeeze=False, layout="constrained")
             fig.suptitle("EDDY QUAD - SNR and CNR", fontsize=19, weight="semibold")
             for i in range(rows):
                 title = labels[i] if i < len(labels) else f"shell {i}"
-                nii = qc_dir / f"cnr{i:04d}.nii.gz"
-                if nii.is_file():
+                if use_numeric_maps:
+                    nii = numeric_maps[i]
                     data = _volume(nii)[0]
                     finite = data[np.isfinite(data) & (data >= 0)]
                     vmax = float(np.percentile(finite, 99)) if finite.size else 1
@@ -800,14 +808,18 @@ class _Composer:
                     colourbar.set_label("SNR" if i == 0 else "CNR")
                 else:
                     png = qc_dir / f"cnr{i:04d}.nii.gz.png"
-                    for axis in axes[i, :]:
-                        axis.axis("off")
+                    axis = axes.flat[i]
+                    axis.axis("off")
+                    axis.set_title(f"{title}: {values[i]:.2f}", fontsize=14,
+                                   weight="semibold", color=t["fg"])
                     if png.is_file():
-                        axes[i, 1].imshow(plt.imread(png), interpolation="nearest")
+                        axis.imshow(plt.imread(png), interpolation="nearest")
                     else:
-                        axes[i, 1].text(0.5, 0.5, "Spatial map unavailable", ha="center",
-                                             va="center", transform=axes[i, 1].transAxes,
-                                             color=t["fg"])
+                        axis.text(0.5, 0.5, "Spatial map unavailable", ha="center",
+                                  va="center", transform=axis.transAxes, color=t["fg"])
+            if not use_numeric_maps:
+                for axis in axes.flat[rows:]:
+                    axis.axis("off")
             fig.savefig(output, dpi=175, facecolor=t["bg"])
             plt.close(fig)
 
