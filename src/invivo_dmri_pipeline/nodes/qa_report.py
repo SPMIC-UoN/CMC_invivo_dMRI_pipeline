@@ -31,6 +31,8 @@ from nipype.interfaces.base import (
     isdefined, traits,
 )
 
+from .signal_uniformity import process_image as process_signal_uniformity
+
 
 THEMES = {
     "light": {"bg": "#ffffff", "fg": "#172033", "grid": "#e5eaf0",
@@ -256,7 +258,7 @@ class QAReport(SimpleInterface):
 
 
 class _Composer:
-    REPORT_VERSION = "2026-10-27.2"
+    REPORT_VERSION = "2026-10-27.3"
 
     def __init__(self, root, outdir, run_mode, supplied):
         self.root = root
@@ -470,6 +472,7 @@ class _Composer:
         self._registration()
         self._xtract()
         self._final_shell_averages()
+        self._signal_uniformity()
         paths = self._write_reports()
         return paths
 
@@ -600,6 +603,64 @@ class _Composer:
                 section, f"final_shell_b{shell}", f"Final b={shell} shell average",
                 f"Mean of {len(indices)} final corrected volumes in the b={shell} shell.",
                 render, (mean_path,))
+
+    def _signal_uniformity(self):
+        section = self.section(
+            "signal-uniformity", "Spatial signal uniformity",
+            "A broad log-domain smooth field is estimated independently for each final "
+            "shell average within the pipeline brain mask. This is descriptive dMRI "
+            "signal QA and does not assign the variation to a specific physical cause.")
+        mask = self._source("uniformity_mask", self.supplied["mask_file"],
+                            self.root / "data" / "nodif_brain_mask.nii.gz")
+        if not mask:
+            section["notes"].append("The pipeline brain mask was unavailable.")
+            self.issue("warning", "Signal-uniformity QA unavailable",
+                       "A pipeline-derived brain mask is required.")
+            return
+        output_dir = self.outdir / "signal_uniformity"
+        for shell, _, mean_path in self.shell_average_specs:
+            if not mean_path.is_file():
+                continue
+            try:
+                metrics = process_signal_uniformity(mean_path, output_dir, mask, 30.0)
+                product_dir = output_dir / mean_path.name.removesuffix(".nii.gz")
+                field = product_dir / "smooth_signal_field.nii.gz"
+                ratio = product_dir / "observed_expected_ratio.nii.gz"
+                low = product_dir / "low_signal_score.nii.gz"
+                self.figure(
+                    section, f"signal_uniformity_b{shell}", f"b={shell} signal uniformity",
+                    "Top: median-normalised smooth signal field. Bottom: observed/local-"
+                    "expected ratio; spatially coherent low values merit review. "
+                    f"Field 5th–95th percentiles: {metrics['field_p05_p50_p95'][0]:.2f}–"
+                    f"{metrics['field_p05_p50_p95'][2]:.2f}.",
+                    lambda path, theme, field=field, ratio=ratio, shell=shell:
+                        self._uniformity_panel(field, ratio, shell, path, theme),
+                    (mean_path, mask, field, ratio, low))
+            except Exception as exc:
+                self.issue("warning", f"Could not assess b={shell} signal uniformity", exc)
+        if not section["figures"]:
+            section["notes"].append("No completed shell average could be assessed.")
+
+    @staticmethod
+    def _uniformity_panel(field_path, ratio_path, shell, output, theme):
+        field = _volume(field_path)[0]
+        ratio = _volume(ratio_path)[0]
+        with plt.rc_context(_figure_rc(theme)):
+            fig, axes = plt.subplots(2, 3, figsize=(15, 7), layout="constrained")
+            fig.suptitle(f"Spatial signal uniformity: b={shell}", fontsize=18,
+                         weight="semibold")
+            for row, (label, data, cmap, limits) in enumerate((
+                    ("Smooth field", field, "coolwarm", (0.5, 1.5)),
+                    ("Observed / expected", ratio, "coolwarm", (0.5, 1.5)))):
+                for column, view in enumerate(_views(data)):
+                    axes[row, column].imshow(view, cmap=cmap, vmin=limits[0],
+                                             vmax=limits[1], interpolation="nearest")
+                    axes[row, column].set_title(
+                        ("Sagittal", "Coronal", "Axial")[column] if row == 0 else "")
+                    axes[row, column].set_ylabel(label, weight="semibold")
+                    axes[row, column].axis("off")
+            fig.savefig(output, dpi=170, facecolor=THEMES[theme]["bg"])
+            plt.close(fig)
 
     @staticmethod
     def _denoise_panel(raw, den, indices, title, path, theme):

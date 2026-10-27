@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 cmc_invivo_pipeline = "invivo_dmri_pipeline.bootstrap:entrypoint"
+cmc_signal_uniformity = "invivo_dmri_pipeline.nodes.signal_uniformity:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -146,7 +146,13 @@ dmri_root/
   xtract/
     tract PNGs (viewer exports), tracts containging xtract tract density maps
   QA/
-    QA_report.pdf                         # multi-page report
+    CMC_invivo_QA.html                    # interactive light/dark QA report
+    CMC_invivo_QA.pdf                     # light multi-page report
+    CMC_invivo_QA_dark.pdf                # dark multi-page report
+    QA_manifest.json                      # sources, checks, issues and provenance
+    shell_averages/                       # reusable FSL means of final corrected shells
+    signal_uniformity/                    # smooth fields, signal ratios and metrics by shell
+    figures/                              # individual light/dark QA panels
 ```
 
 ---
