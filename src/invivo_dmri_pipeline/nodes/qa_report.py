@@ -258,7 +258,7 @@ class QAReport(SimpleInterface):
 
 
 class _Composer:
-    REPORT_VERSION = "2026-10-27.3"
+    REPORT_VERSION = "2026-10-27.4"
 
     def __init__(self, root, outdir, run_mode, supplied):
         self.root = root
@@ -464,15 +464,15 @@ class _Composer:
         self._step_status()
         self._audit_failures()
         self._start_final_shell_averages()
-        self._denoising()
         self._topup()
+        self._denoising()
         self._eddy()
+        self._final_shell_averages()
+        self._signal_uniformity()
         self._mask()
         self._diffusion_maps()
         self._registration()
         self._xtract()
-        self._final_shell_averages()
-        self._signal_uniformity()
         paths = self._write_reports()
         return paths
 
@@ -652,13 +652,17 @@ class _Composer:
             for row, (label, data, cmap, limits) in enumerate((
                     ("Smooth field", field, "coolwarm", (0.5, 1.5)),
                     ("Observed / expected", ratio, "coolwarm", (0.5, 1.5)))):
+                artist = None
                 for column, view in enumerate(_views(data)):
-                    axes[row, column].imshow(view, cmap=cmap, vmin=limits[0],
-                                             vmax=limits[1], interpolation="nearest")
+                    artist = axes[row, column].imshow(
+                        view, cmap=cmap, vmin=limits[0], vmax=limits[1],
+                        interpolation="nearest")
                     axes[row, column].set_title(
                         ("Sagittal", "Coronal", "Axial")[column] if row == 0 else "")
                     axes[row, column].set_ylabel(label, weight="semibold")
                     axes[row, column].axis("off")
+                colourbar = fig.colorbar(artist, ax=axes[row, :], fraction=.018, pad=.012)
+                colourbar.set_label("Relative signal (median = 1)")
             fig.savefig(output, dpi=170, facecolor=THEMES[theme]["bg"])
             plt.close(fig)
 
@@ -734,13 +738,15 @@ class _Composer:
         shells = [shell for shell in (qc.get("data_unique_bvals") or [])
                   if float(shell) > 0]
         if values:
+            signal_maps = tuple(qc_path.parent / f"cnr{i:04d}.nii.gz"
+                                for i in range(len(values)))
             self.themed_figure(
                 section, "eddy_signal", "b0 SNR and shell CNR",
                 "QUAD b0 SNR (first panel) and CNR per nonzero shell. The b0 SNR "
                 "map can look speckled when few b0 repetitions make the voxelwise "
                 "standard-deviation estimate unstable; examine averaged b0s as well.",
                 lambda path, theme: self._eddy_signal_panel(qc, qc_path.parent, path, theme),
-                (qc_path,))
+                (qc_path, *signal_maps))
         else:
             section["notes"].append("QUAD SNR/CNR values were absent from qc.json.")
         eddy_dir = self.root / "eddy"
@@ -762,29 +768,46 @@ class _Composer:
     @staticmethod
     def _eddy_signal_panel(qc, qc_dir, output, theme):
         values = qc.get("qc_cnr_avg") or []
-        shells = qc.get("data_unique_bvals") or []
+        shells = [shell for shell in (qc.get("data_unique_bvals") or [])
+                  if float(shell) > 0]
         if not values:
             raise ValueError("qc_cnr_avg missing")
         t = THEMES[theme]
         labels = ["b0 SNR"] + [f"b={shell} CNR" for shell in shells]
-        rows = (len(values) + 1) // 2
+        rows = len(values)
         with plt.rc_context(_figure_rc(theme)):
-            fig, axes = plt.subplots(rows, 2, figsize=(15, max(6, rows * 3.9)),
+            fig, axes = plt.subplots(rows, 3, figsize=(15, max(6, rows * 3.45)),
                                      squeeze=False, layout="constrained")
             fig.suptitle("EDDY QUAD - SNR and CNR", fontsize=19, weight="semibold")
-            for i, axis in enumerate(axes.flat):
-                axis.axis("off")
-                if i >= len(values):
-                    continue
+            for i in range(rows):
                 title = labels[i] if i < len(labels) else f"shell {i}"
-                axis.set_title(f"{title}: {values[i]:.2f}", fontsize=15,
-                               weight="semibold", color=t["fg"])
-                png = qc_dir / f"cnr{i:04d}.nii.gz.png"
-                if png.is_file():
-                    axis.imshow(plt.imread(png), interpolation="nearest")
+                nii = qc_dir / f"cnr{i:04d}.nii.gz"
+                if nii.is_file():
+                    data = _volume(nii)[0]
+                    finite = data[np.isfinite(data) & (data >= 0)]
+                    vmax = float(np.percentile(finite, 99)) if finite.size else 1
+                    artist = None
+                    for column, view in enumerate(_views(data)):
+                        artist = axes[i, column].imshow(
+                            view, cmap="viridis", vmin=0, vmax=vmax,
+                            interpolation="nearest")
+                        axes[i, column].set_title(
+                            ("Sagittal", "Coronal", "Axial")[column] if i == 0 else "")
+                        axes[i, column].axis("off")
+                    axes[i, 0].set_ylabel(f"{title}\nmean {values[i]:.2f}",
+                                          weight="semibold", color=t["fg"])
+                    colourbar = fig.colorbar(artist, ax=axes[i, :], fraction=.018, pad=.012)
+                    colourbar.set_label("SNR" if i == 0 else "CNR")
                 else:
-                    axis.text(0.5, 0.5, "Spatial map unavailable", ha="center",
-                              va="center", transform=axis.transAxes, color=t["fg"])
+                    png = qc_dir / f"cnr{i:04d}.nii.gz.png"
+                    for axis in axes[i, :]:
+                        axis.axis("off")
+                    if png.is_file():
+                        axes[i, 1].imshow(plt.imread(png), interpolation="nearest")
+                    else:
+                        axes[i, 1].text(0.5, 0.5, "Spatial map unavailable", ha="center",
+                                             va="center", transform=axes[i, 1].transAxes,
+                                             color=t["fg"])
             fig.savefig(output, dpi=175, facecolor=t["bg"])
             plt.close(fig)
 
@@ -1323,13 +1346,18 @@ class _Composer:
                 light = f'figures/{esc(figure["light"])}'
                 dark = f'figures/{esc(figure["dark"])}'
                 sources = "".join(f"<li>{esc(path)}</li>" for path in figure["sources"])
+                launch = self._fsleyes_launch_command(figure["sources"])
                 cards.append(
                     f'<article class="figure"><h3>{esc(figure["title"])}</h3>'
                     f'<img class="theme-light" src="{light}" alt="{esc(figure["title"])}">'
                     f'<img class="theme-dark" src="{dark}" alt="{esc(figure["title"])}">'
                     f'<p>{esc(figure["caption"])}</p>'
                     + (f'<details><summary>Source files</summary><ul>{sources}</ul></details>'
-                       if sources else "") + '</article>')
+                       if sources else "")
+                    + (f'<details class="launch"><summary>Launch interactive view</summary>'
+                       f'<p>Copy into a terminal on the processing host:</p>'
+                       f'<pre><code>{esc(launch)}</code></pre></details>' if launch else "")
+                    + '</article>')
             notes = "".join(f'<p class="note">{esc(note)}</p>' for note in section["notes"])
             section_html.append(
                 f'<section id="{esc(section["id"])}"><div class="section-head">'
@@ -1378,6 +1406,8 @@ h2 {{ font-size:28px; margin:6px 0 8px; }} .section-head p, .note {{ color:var(-
 .figure p {{ color:var(--sub); font-size:14px; }} .figure details {{ color:var(--sub); font-size:12px; }}
 .figure li {{ overflow-wrap:anywhere; margin:4px 0; }} .note {{ background:var(--paper); border:1px dashed var(--line);
  padding:14px 18px; border-radius:10px; }} .theme-dark {{ display:none!important; }}
+pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); border:1px solid var(--line);
+ padding:11px; border-radius:8px; color:var(--text); user-select:all; }}
 body[data-theme="dark"] .theme-dark {{ display:block!important; }}
 body[data-theme="dark"] .theme-light {{ display:none!important; }}
 table {{ border-collapse:collapse; width:100%; font-size:13px; }} th,td {{ padding:8px 10px;
@@ -1415,6 +1445,52 @@ function label(){{button.textContent=body.dataset.theme==='dark'?'Light mode':'D
 button.onclick=()=>{{body.dataset.theme=body.dataset.theme==='dark'?'light':'dark';
  try {{ localStorage.setItem('cmc-qa-theme',body.dataset.theme); }} catch (_) {{}} label();}};label();
 </script></body></html>'''
+
+    def _fsleyes_launch_command(self, sources):
+        paths = []
+        for source in sources:
+            value = str(source)
+            if (value.endswith((".nii", ".nii.gz")) and Path(value).is_file()
+                    and value not in paths):
+                paths.append(value)
+        if not paths:
+            return ""
+        command = ["fsleyes"]
+        tract_options = {}
+        for view in ("sagittal", "coronal", "axial"):
+            for tract, cmap, low, high in _Composer._xtract_view_spec(view):
+                tract_options.setdefault(tract, (cmap, low, high))
+        for path in paths:
+            name = Path(path).name.lower()
+            tract = Path(path).parent.name
+            command += [path, "--name", Path(path).name.removesuffix(".nii.gz")]
+            if "smooth_signal_field" in name or "observed_expected_ratio" in name:
+                command += ["--cmap", "coolwarm", "--displayRange", "0.5", "1.5"]
+            elif "low_signal_score" in name:
+                command += ["--cmap", "hot", "--displayRange", "0", "1"]
+            elif "cnr" in name:
+                command += ["--cmap", "viridis", "--displayRange", "0", "99%"]
+            elif "mask" in name:
+                command += ["--overlayType", "mask", "--maskColour", "1", "0", "0",
+                            "--outline", "--outlineWidth", "2"]
+            elif "densitynorm" in name:
+                cmap, low, high = tract_options.get(tract, ("red-yellow", .001, .1))
+                command += ["--overlayType", "mip", "--cmap", cmap,
+                            "--displayRange", str(low), str(high)]
+            elif "_v1" in name:
+                command += ["--overlayType", "rgbvector"]
+            elif "_md" in name:
+                command += ["--cmap", "greyscale", "--displayRange", "0", "0.003"]
+            elif "nmt_fa" in name or "hcp1065_fa" in name:
+                threshold = ".1" if self.mode == "hum" else ".2"
+                command += ["--overlayType", "mask", "--maskColour", "1", "0", "0",
+                            "--maskInvert", "--threshold", "0", threshold,
+                            "--outline", "--outlineWidth", "3"]
+            elif "_fa" in name or "fa_" in name:
+                command += ["--cmap", "greyscale", "--displayRange", "0", "1"]
+            else:
+                command += ["--cmap", "greyscale", "--displayRange", "0", "99%"]
+        return shlex.join(command) + " &"
 
     def _pdf(self, path, theme, metadata):
         t = THEMES[theme]
