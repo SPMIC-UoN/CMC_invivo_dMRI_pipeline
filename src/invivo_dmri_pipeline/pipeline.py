@@ -384,7 +384,12 @@ def build_workflow(
             dmri_root, wf_name, "graph.png"
         )
 
-        # Eddy QC from original preproc
+        # Reuse the completed EDDY QC summary from the original preprocessing run.
+        # There is no QUAD node in tract-only mode to connect as a dependency.
+        qa.inputs.eddy_qc_json = os.path.join(
+            eddy_dir_root, "eddy.qc", "qc.json"
+        )
+
         qa.inputs.nmt_mask_img = (
             pkg_file("files", "NMT_v2.0_sym_05mm_LR_brainmask.nii.gz")
             if MODE == "nhp"

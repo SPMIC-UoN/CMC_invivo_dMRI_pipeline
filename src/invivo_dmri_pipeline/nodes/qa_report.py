@@ -583,7 +583,11 @@ class _Composer:
             return
         self.qc = qc
         values = qc.get("qc_cnr_avg") or []
-        shells = qc.get("data_unique_bvals") or []
+        # QUAD lists b=0 in data_unique_bvals, while qc_cnr_avg uses its first
+        # entry for b0 SNR. Only nonzero shells should therefore receive CNR
+        # labels; otherwise every diffusion shell is shifted by one label.
+        shells = [shell for shell in (qc.get("data_unique_bvals") or [])
+                  if float(shell) > 0]
         if values:
             self.themed_figure(
                 section, "eddy_signal", "b0 SNR and shell CNR",
