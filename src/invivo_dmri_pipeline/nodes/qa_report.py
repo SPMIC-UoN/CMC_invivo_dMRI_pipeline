@@ -13,6 +13,7 @@ import json
 import re
 import shlex
 import shutil
+import subprocess
 import textwrap
 from collections import defaultdict
 from pathlib import Path
@@ -255,6 +256,8 @@ class QAReport(SimpleInterface):
 
 
 class _Composer:
+    REPORT_VERSION = "2026-10-27.1"
+
     def __init__(self, root, outdir, run_mode, supplied):
         self.root = root
         self.outdir = outdir
@@ -447,6 +450,7 @@ class _Composer:
         self._step_status()
         self._audit_failures()
         self._denoising()
+        self._final_shell_averages()
         self._topup()
         self._eddy()
         self._mask()
@@ -460,8 +464,8 @@ class _Composer:
         section = self.section(
             "denoising", "Before and after denoising",
             "Matched raw and denoised magnitude data are shown for a representative "
-            "volume and a within-run shell average. Display scaling is shared across "
-            "each before/after pair; averaging is before motion correction.")
+            "volume from each shell. Display scaling is shared across each before/after "
+            "pair. Raw acquisitions are not shell-averaged.")
         if not bool(self.config.get("denoise", True)):
             section["notes"].append("Denoising was disabled in the saved configuration.")
             return
@@ -495,8 +499,10 @@ class _Composer:
                     self.issue("error", f"Denoising dimensions mismatch for {raw.name}", exc)
                     continue
                 for shell, indices in _shell_groups(values, tolerance).items():
-                    representatives.setdefault((tag, shell), (raw, den, indices, ordinal))
-        for (tag, shell), (raw, den, indices, ordinal) in sorted(representatives.items()):
+                    # One representative raw/denoised example per shell across
+                    # the session. Raw shell averaging is intentionally avoided.
+                    representatives.setdefault(shell, (tag, raw, den, indices, ordinal))
+        for shell, (tag, raw, den, indices, ordinal) in sorted(representatives.items()):
             label = f"{tag} run {ordinal}, b={shell}"
             example = int(indices[len(indices) // 2])
             prefix = f"denoise_{tag.lower()}_b{shell}"
@@ -507,15 +513,44 @@ class _Composer:
                 lambda path, theme, raw=raw, den=den, example=example, label=label:
                     self._denoise_panel(raw, den, [example], label + " - example volume", path, theme),
                 (raw, den, _sidecar(raw, ".bval")))
-            self.figure(
-                section, prefix + "_average", label + " - shell average",
-                f"Mean of {len(indices)} volumes in this run and shell. This can reveal "
-                "persistent ghosting or spatially structured residual noise.",
-                lambda path, theme, raw=raw, den=den, indices=indices, label=label:
-                    self._denoise_panel(raw, den, indices, label + " - shell average", path, theme),
-                (raw, den, _sidecar(raw, ".bval")))
         if not section["figures"]:
             section["notes"].append("No complete raw/denoised run with usable b-values was found.")
+
+    def _final_shell_averages(self):
+        section = self.section(
+            "final-shells", "Final distortion-corrected shell averages",
+            "Shell averages are calculated only from the final denoised, motion- and "
+            "distortion-corrected data. Raw acquisitions are not averaged for QA.")
+        data_path = self._source("final_corrected_data", self.supplied["data_4d"],
+                                 self.root / "data" / "data.nii.gz")
+        bvals_path = self._source("final_corrected_bvals", self.supplied["bvals"],
+                                  self.root / "data" / "bvals")
+        values = _bvals(bvals_path)
+        if not data_path or values is None:
+            section["notes"].append("Final corrected data or b-values were unavailable.")
+            return
+        try:
+            image = nib.load(str(data_path))
+            if len(image.shape) != 4 or image.shape[3] != len(values):
+                raise ValueError(f"data shape={image.shape}, b-values={len(values)}")
+        except Exception as exc:
+            self.issue("error", "Final shell averaging unavailable", exc)
+            section["notes"].append("Final data and b-value dimensions were inconsistent.")
+            return
+        tolerance = float(self.config.get("b0range", 60))
+        cache = {}
+        for shell, indices in sorted(_shell_groups(values, tolerance).items()):
+            def render(path, theme, shell=shell, indices=indices):
+                if shell not in cache:
+                    cache[shell] = _mean_volume(data_path, indices)
+                average = cache[shell]
+                _montage([(f"b={shell} mean", average)],
+                         f"Final corrected shell average: b={shell}", path,
+                         vmax=_scale((average,)), theme=theme)
+            self.figure(
+                section, f"final_shell_b{shell}", f"Final b={shell} shell average",
+                f"Mean of {len(indices)} final corrected volumes in the b={shell} shell.",
+                render, (data_path, bvals_path))
 
     @staticmethod
     def _denoise_panel(raw, den, indices, title, path, theme):
@@ -847,7 +882,7 @@ class _Composer:
                 fig.suptitle("DTIFIT: FA, MD and FA-modulated V1", fontsize=19,
                              weight="semibold")
                 rows = [("FA", fa_data, "gray", 1.0),
-                        ("MD (mm²/s)", md_data, "magma", max_md),
+                        ("MD (mm²/s)", md_data, "gray", max_md),
                         ("V1 × FA", rgb, None, None)]
                 for i, (label, data, cmap, maximum) in enumerate(rows):
                     for j, plane in enumerate(_views(data)):
@@ -883,20 +918,55 @@ class _Composer:
             return
 
         def render(path, theme):
-            subject_img = nib.load(str(transformed))
-            template_img = _match_grid(nib.load(str(reference)), subject_img)
-            subject = _canon(np.asarray(subject_img.dataobj), subject_img.affine)
-            template = _canon(np.asarray(template_img.dataobj), template_img.affine)
-            if subject.shape != template.shape:
-                raise ValueError("Template FA could not be aligned to subject standard-space FA")
-            _montage([("Subject FA + WM outline", subject)],
-                     "Registration to standard space", path, vmax=0.8,
-                     masks=[template > 0.2], theme=theme)
+            self._registration_fsleyes(transformed, reference, path)
 
         self.figure(section, "standard_fa_overlay", "FA in standard space",
                     "The red contour is template white matter (FA > 0.2). "
                     "Inspect cortical, callosal and cerebellar alignment.",
                     render, (transformed, reference))
+
+    @staticmethod
+    def _registration_fsleyes(subject, reference, output):
+        """Render subject FA with a true template-derived FA>0.2 outline."""
+        executable = shutil.which("fsleyes")
+        if not executable:
+            raise FileNotFoundError("fsleyes was not found on PATH")
+        ref_img = nib.load(str(reference))
+        ref_data = np.asarray(ref_img.dataobj)
+        coords = np.argwhere(np.isfinite(ref_data) & (ref_data > 0.2))
+        centre = coords.mean(axis=0) if coords.size else np.asarray(ref_img.shape[:3]) / 2
+        world = nib.affines.apply_affine(ref_img.affine, centre)
+        if coords.size:
+            lower, upper = coords.min(axis=0), coords.max(axis=0)
+            corners = np.asarray([
+                [x, y, z]
+                for x in (lower[0], upper[0])
+                for y in (lower[1], upper[1])
+                for z in (lower[2], upper[2])
+            ])
+            world_x = nib.affines.apply_affine(ref_img.affine, corners)[:, 0]
+            lateral = float(world_x.min())
+            midline = float((world_x.min() + world_x.max()) / 2)
+            world[0] = (lateral + midline) / 2
+        command = [
+            executable, "render", "--outfile", str(output), "--size", "2400", "900",
+            "--scene", "ortho", "--worldLoc", *(f"{value:.8f}" for value in world),
+            "--displaySpace", str(reference),
+            "--xzoom", "100", "--yzoom", "100", "--zzoom", "100",
+            "--hideLabels", "--showLocation", "no", "--layout", "horizontal",
+            "--hideCursor", "--bgColour", "0", "0", "0", "--fgColour", "1", "1", "1",
+            str(subject), "--name", "FA_in_STD", "--overlayType", "volume",
+            "--alpha", "100", "--cmap", "greyscale", "--displayRange", "0", "1",
+            "--interpolation", "none", "--volume", "0",
+            str(reference), "--name", "Template_FA", "--overlayType", "mask",
+            "--alpha", "100", "--maskColour", "1", "0", "0", "--maskInvert",
+            "--threshold", "0", "0.2", "--outline", "--outlineWidth", "3",
+            "--interpolation", "none", "--volume", "0",
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+        if not Path(output).is_file() or not Path(output).stat().st_size:
+            raise RuntimeError("FSLeyes completed without creating the registration PNG")
 
     def _xtract(self):
         section = self.section(
@@ -1000,6 +1070,7 @@ class _Composer:
             "denoise", "run_gibbs", "run_n4", "stdreg_method", "eddy_extra_args")
             if key in self.config}
         metadata = {
+            "report_version": self.REPORT_VERSION,
             "generated": self.timestamp, "dmri_root": str(self.root),
             "run_mode": self.run_mode, "species_mode": self.mode,
             "config": config_summary, "data": data_info,
