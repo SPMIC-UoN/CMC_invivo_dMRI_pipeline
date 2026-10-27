@@ -1,1121 +1,1223 @@
-import os
-import json
-import datetime
-import subprocess
+"""Self-contained visual QA for CMC in-vivo diffusion processing.
 
-import numpy as np
-import nibabel as nib
+The HTML report is the primary, theme-switchable deliverable. Two PDF exports
+and the individual PNG panels are written alongside it. Missing inputs become
+visible QA notes rather than fatal exceptions.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import html
+import json
+import re
+import shlex
+import shutil
+import textwrap
+from collections import defaultdict
+from pathlib import Path
+
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import nibabel as nib
+import numpy as np
+import yaml
 from matplotlib.backends.backend_pdf import PdfPages
-
 from nipype.interfaces.base import (
-    BaseInterfaceInputSpec,
-    TraitedSpec,
-    File,
-    traits,
-    SimpleInterface,
-    isdefined,
+    BaseInterfaceInputSpec, Directory, File, SimpleInterface, TraitedSpec,
+    isdefined, traits,
 )
 
 
+THEMES = {
+    "light": {"bg": "#ffffff", "fg": "#172033", "grid": "#e5eaf0",
+              "blue": "#3274a1", "amber": "#d78322", "green": "#178a78",
+              "red": "#c45367"},
+    "dark": {"bg": "#111827", "fg": "#f3f4f6", "grid": "#374151",
+             "blue": "#60a5fa", "amber": "#fbbf24", "green": "#34d399",
+             "red": "#fb7185"},
+}
+TAG_RE = re.compile(r"^(AP|PA|LR|RL)(_ph)?_(\d+)\.nii(?:\.gz)?$", re.I)
+
+
+def _existing(path):
+    path = Path(path).expanduser() if path else None
+    return path if path and path.is_file() else None
+
+
+def _run_key(path):
+    match = TAG_RE.match(Path(path).name)
+    return (match.group(1).upper(), int(match.group(3))) if match else None
+
+
+def _image_paths(entries):
+    """Expand configuration entries that may be images or image directories."""
+    paths = []
+    for entry in entries or []:
+        path = Path(entry).expanduser()
+        if path.is_dir():
+            paths.extend(p for p in path.iterdir() if TAG_RE.match(p.name))
+        elif path.is_file() and TAG_RE.match(path.name):
+            paths.append(path)
+    return sorted(set(paths), key=lambda p: (_run_key(p) or ("", 0), str(p)))
+
+
+def _configured_paths(entries, config_path):
+    """Resolve relative paths as the pipeline does, using the saved YAML location."""
+    base = Path(config_path).parent if config_path else Path.cwd()
+    if isinstance(entries, (str, Path)):
+        entries = [entries]
+    result = []
+    for entry in entries or []:
+        path = Path(entry).expanduser()
+        result.append(path if path.is_absolute() else base / path)
+    return result
+
+
+def _bvals(path):
+    if not _existing(path):
+        return None
+    try:
+        return np.atleast_1d(np.loadtxt(path, dtype=float)).ravel()
+    except (OSError, ValueError):
+        return None
+
+
+def _sidecar(path, suffix):
+    name = str(path)
+    stem = name[:-7] if name.endswith(".nii.gz") else name[:-4] if name.endswith(".nii") else name
+    return Path(stem + suffix)
+
+
+def _shell_groups(values, b0range=60):
+    """Group nearby nominal b values without assuming fixed shells."""
+    values = np.asarray(values, dtype=float)
+    result = {}
+    bzero = np.flatnonzero(np.isfinite(values) & (values <= b0range))
+    if len(bzero):
+        result[0] = bzero
+    groups = []
+    for value in sorted(set(float(v) for v in values if np.isfinite(v) and v > b0range)):
+        if not groups or value - np.median(groups[-1]) > b0range:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    for group in groups:
+        centre = float(np.median(group))
+        shell = int(round(centre / 10) * 10)
+        result[shell] = np.flatnonzero(np.isin(values, group))
+    return result
+
+
+def _canon(data, affine):
+    image = nib.Nifti1Image(np.asarray(data, dtype=np.float32), affine)
+    return np.asarray(nib.as_closest_canonical(image).dataobj)
+
+
+def _volume(path, index=0):
+    image = nib.load(str(path))
+    if len(image.shape) == 4:
+        index = min(max(int(index), 0), image.shape[3] - 1)
+        data = np.asarray(image.dataobj[..., index], dtype=np.float32)
+    else:
+        data = np.asarray(image.dataobj, dtype=np.float32)
+    return _canon(data, image.affine), image
+
+
+def _mean_volume(path, indices):
+    image = nib.load(str(path))
+    if len(image.shape) == 3:
+        return _volume(path)[0]
+    indices = [int(i) for i in indices if 0 <= int(i) < image.shape[3]]
+    if not indices:
+        raise ValueError(f"No valid volume indices for {path}")
+    mean = np.zeros(image.shape[:3], dtype=np.float32)
+    # Stream one 3-D volume at a time, so high-resolution DWI does not require
+    # holding a full 4-D run in memory.
+    for index in indices:
+        mean += np.asarray(image.dataobj[..., index], dtype=np.float32)
+    mean /= len(indices)
+    return _canon(mean, image.affine)
+
+
+def _views(data, centre=None):
+    spatial = data.shape[:3]
+    xyz = centre or tuple(s // 2 for s in spatial)
+    xyz = tuple(min(max(int(v), 0), spatial[i] - 1) for i, v in enumerate(xyz))
+    return [np.rot90(data[xyz[0], ...]),
+            np.rot90(data[:, xyz[1], ...]),
+            np.rot90(data[:, :, xyz[2], ...])]
+
+
+def _scale(arrays):
+    samples = [np.asarray(a[::5, ::5, ::5]).ravel() for a in arrays]
+    values = np.concatenate(samples)
+    values = values[np.isfinite(values) & (values > 0)]
+    return float(np.percentile(values, 99.5)) if values.size else 1.0
+
+
+def _figure_rc(theme):
+    t = THEMES[theme]
+    return {"font.family": "DejaVu Sans", "font.size": 11,
+            "figure.facecolor": t["bg"], "axes.facecolor": t["bg"],
+            "axes.edgecolor": t["fg"], "axes.labelcolor": t["fg"],
+            "text.color": t["fg"], "xtick.color": t["fg"],
+            "ytick.color": t["fg"]}
+
+
+def _montage(rows, title, output, labels=("Sagittal", "Coronal", "Axial"),
+             cmap="gray", vmax=None, masks=None, rgb=False, theme="dark"):
+    """Rows of matched, three-plane views with optional mask outlines."""
+    with plt.rc_context(_figure_rc(theme)):
+        fig, axes = plt.subplots(len(rows), 3, figsize=(15, 3.45 * len(rows)),
+                                 squeeze=False, layout="constrained")
+        fig.suptitle(title, fontsize=18, weight="semibold")
+        for i, (name, data) in enumerate(rows):
+            views = _views(data)
+            overlay = _views(masks[i]) if masks and masks[i] is not None else None
+            for j, (axis, view) in enumerate(zip(axes[i], views)):
+                axis.imshow(view if rgb else view, cmap=None if rgb else cmap,
+                            vmin=None if rgb else 0,
+                            vmax=None if rgb else vmax, interpolation="nearest")
+                if overlay is not None:
+                    axis.contour(overlay[j] > 0.5, levels=[0.5], colors="#fb7185",
+                                 linewidths=1.1)
+                axis.set_title(labels[j] if i == 0 else "", fontsize=11)
+                axis.set_ylabel(name, fontsize=12, weight="semibold")
+                axis.set_xticks([])
+                axis.set_yticks([])
+                for side in axis.spines.values():
+                    side.set_visible(False)
+        fig.savefig(output, dpi=170, facecolor=THEMES[theme]["bg"])
+        plt.close(fig)
+
+
+def _match_grid(source, target, order=1):
+    """Resample a 3-D image only when the affine or shape differs."""
+    if source.shape[:3] == target.shape[:3] and np.allclose(source.affine, target.affine):
+        return source
+    from nibabel.processing import resample_from_to
+    return resample_from_to(source, (target.shape[:3], target.affine), order=order)
+
+
 class QAReportInputSpec(BaseInterfaceInputSpec):
-    # General
-    dmri_root = traits.Str(desc="Root directory for this dMRI session")
-    outdir = traits.Str(desc="Output directory for QA report")
-    pipeline_yaml = File(exists=False, desc="Copy of the pipeline YAML (for reference)")
-
-    # Eddy QC
-    eddy_qc_json = File(exists=False, desc="FSL eddy_qc qc.json file")
-
-    # Mode: how pipeline was run
-    run_mode = traits.Enum(
-        "preproc_only",
-        "full",
-        "tract_only",
-        usedefault=True,
-        desc="Pipeline run mode for this QA ('preproc_only', 'full', or 'tract_only')",
-    )
-
-    # Nipype logs and graphs
-    nipype_dir_preproc = traits.Str(
-        desc="Nipype log directory for main preprocessing/full run"
-    )
-    nipype_dir_tract = traits.Str(
-        desc="Nipype log directory for tract-only run (if present)"
-    )
-    nipype_graph_preproc = File(
-        exists=False, desc="Path to Nipype workflow graph image for main run"
-    )
-    nipype_graph_tract = File(
-        exists=False, desc="Path to Nipype workflow graph image for tract-only run"
-    )
-
-    # Template / standard-space
-    nmt_mask_img = File(exists=False, desc="Standard space brain mask (e.g. NMT or MNI)")
-    nmt_fa_img = File(exists=False, desc="FA in standard space (subject or template)")
-
-    # Native diffusion-space inputs
-    data_4d = File(exists=False, desc="Post-EDDY 4D diffusion data")
-    bvals = File(exists=False, desc="B-values file (post-EDDY)")
-    bvecs = File(exists=False, desc="B-vectors file (post-EDDY)")
-    mask_file = File(exists=False, desc="Brain mask in diffusion space")
-    fa_img = File(exists=False, desc="Native-space FA image (DTIFIT)")
-    v1_img = File(exists=False, desc="Primary eigenvector image (DTIFIT V1)")
-
-    # XTRACT outputs
-    xtract_dir = File(exists=False, desc="XTRACT output directory root")
-
-    # Dummy input to force run-last in the workflow
-    deps = traits.Any(desc="Dependencies to force QA run last")
+    dmri_root = traits.Str(desc="Processing directory")
+    outdir = traits.Str(desc="QA output directory")
+    pipeline_yaml = File(exists=False)
+    eddy_qc_json = File(exists=False)
+    run_mode = traits.Enum("preproc_only", "full", "tract_only", usedefault=True)
+    nipype_dir_preproc = traits.Str()
+    nipype_dir_tract = traits.Str()
+    nipype_graph_preproc = File(exists=False)
+    nipype_graph_tract = File(exists=False)
+    nmt_mask_img = File(exists=False)
+    nmt_fa_img = File(exists=False)
+    data_4d = File(exists=False)
+    bvals = File(exists=False)
+    bvecs = File(exists=False)
+    mask_file = File(exists=False)
+    fa_img = File(exists=False)
+    v1_img = File(exists=False)
+    xtract_dir = File(exists=False)
+    deps = traits.Any(desc="Dependency token to run QA last")
 
 
 class QAReportOutputSpec(TraitedSpec):
-    report_pdf = File(desc="Path to the generated PDF QA report")
+    report_pdf = File(desc="Light PDF (legacy output name)")
+    report_pdf_dark = File(desc="Dark PDF")
+    report_html = File(desc="Theme-switchable HTML")
+    manifest_json = File(desc="QA source and issue manifest")
+    figures_dir = Directory(desc="Individual PNG panels")
 
 
 class QAReport(SimpleInterface):
-    """Generate a multi-page PDF QA report."""
-
     input_spec = QAReportInputSpec
     output_spec = QAReportOutputSpec
 
-    # ------------- helpers -------------
-
-    @staticmethod
-    def _safe_load_img(path: str):
-        if not path:
-            return None
-        if not os.path.exists(path):
-            return None
-        try:
-            return nib.load(path)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _safe_json(path: str):
-        if not path:
-            return None
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _world_cog_from_mask(img: nib.Nifti1Image) -> np.ndarray:
-        data = img.get_fdata()
-        mask = data > 0
-        if not np.any(mask):
-            return np.array([np.nan, np.nan, np.nan])
-        coords = np.argwhere(mask)
-        cog_vox = coords.mean(axis=0)
-        return nib.affines.apply_affine(img.affine, cog_vox)
-
-    @staticmethod
-    def _fmt_coord(arr):
-        if arr is None or not np.all(np.isfinite(arr)):
-            return "N/A"
-        return f"[{arr[0]:.2f}, {arr[1]:.2f}, {arr[2]:.2f}]"
-
-    # -------- fsleyes helpers --------
-
-    def _run_fsleyes(self, args):
-        """
-        Run fsleyes render with 'args' (list). fsleyes is assumed available.
-        Fail gracefully if fsleyes is missing or errors.
-        """
-        try:
-            subprocess.run(
-                args,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            # Do not crash QA if fsleyes is unavailable
-            pass
-
-    def _fsleyes_brain_mask(self, fa_path, mask_path, out_png, world_xyz):
-        """
-        Native-space FA + brain mask overlay (red, alpha=50%).
-        """
-        if not (fa_path and mask_path):
-            return
-
-        cmd = [
-            "fsleyes",
-            "render",
-            "--outfile",
-            out_png,
-            "--size",
-            "1800",
-            "800",
-            "--scene",
-            "ortho",
-            "--worldLoc",
-            f"{world_xyz[0]}",
-            f"{world_xyz[1]}",
-            f"{world_xyz[2]}",
-            "--xzoom",
-            "85",
-            "--yzoom",
-            "85",
-            "--zzoom",
-            "85",
-            "--showLocation",
-            "no",
-            "--layout",
-            "horizontal",
-            "--hideCursor",
-            "--bgColour",
-            "0.0",
-            "0.0",
-            "0.0",
-            "--fgColour",
-            "1.0",
-            "1.0",
-            "1.0",
-            fa_path,
-            "--overlayType",
-            "volume",
-            "--cmap",
-            "greyscale",
-            "--brightness",
-            "60",
-            "--contrast",
-            "85",
-            "--volume",
-            "0",
-            mask_path,
-            "--overlayType",
-            "mask",
-            "--alpha",
-            "50",
-            "--cmap",
-            "red",
-            "--volume",
-            "0",
-        ]
-        self._run_fsleyes(cmd)
-
-    def _fsleyes_color_fa(self, fa_path, v1_path, out_png, world_xyz):
-        """
-        Colour FA map via rgbvector V1, modulated by FA.
-        """
-        if not (fa_path and v1_path):
-            return
-
-        cmd = [
-            "fsleyes",
-            "render",
-            "--outfile",
-            out_png,
-            "--size",
-            "2000",
-            "800",
-            "--scene",
-            "ortho",
-            "--worldLoc",
-            f"{world_xyz[0]}",
-            f"{world_xyz[1]}",
-            f"{world_xyz[2]}",
-            "--xzoom",
-            "85",
-            "--yzoom",
-            "85",
-            "--zzoom",
-            "85",
-            "--showLocation",
-            "no",
-            "--layout",
-            "horizontal",
-            "--hideCursor",
-            "--bgColour",
-            "0.0",
-            "0.0",
-            "0.0",
-            "--fgColour",
-            "1.0",
-            "1.0",
-            "1.0",
-            fa_path,
-            "--disabled",
-            "--overlayType",
-            "volume",
-            "--cmap",
-            "greyscale",
-            "--displayRange",
-            "0.0",
-            "98%",
-            "--volume",
-            "0",
-            v1_path,
-            "--overlayType",
-            "rgbvector",
-            "--alpha",
-            "100.0",
-            "--brightness",
-            "65",
-            "--contrast",
-            "72",
-            "--modulateImage",
-            fa_path,
-            "--modulateRange",
-            "0.0",
-            "1",
-            "--modulateMode",
-            "brightness",
-            "--suppressMode",
-            "white",
-        ]
-        self._run_fsleyes(cmd)
-
-    def _fsleyes_nmt_reg(self, fa_std_path, nmt_fa_path, out_png, world_xyz):
-        """
-        FA in STD space with NMT FA outline.
-        Threshold NMT FA at 0.12, red outline.
-        """
-        if not (fa_std_path and nmt_fa_path):
-            return
-
-        cmd = [
-            "fsleyes",
-            "render",
-            "--outfile",
-            out_png,
-            "--size",
-            "1800",
-            "800",
-            "--scene",
-            "ortho",
-            "--worldLoc",
-            f"{world_xyz[0]}",
-            f"{world_xyz[1]}",
-            f"{world_xyz[2]}",
-            "--xzoom",
-            "85",
-            "--yzoom",
-            "85",
-            "--zzoom",
-            "85",
-            "--showLocation",
-            "no",
-            "--layout",
-            "horizontal",
-            "--hideCursor",
-            "--bgColour",
-            "0.0",
-            "0.0",
-            "0.0",
-            "--fgColour",
-            "1.0",
-            "1.0",
-            "1.0",
-            fa_std_path,
-            "--overlayType",
-            "volume",
-            "--cmap",
-            "greyscale",
-            "--displayRange",
-            "0.0",
-            "98%",
-            "--volume",
-            "0",
-            nmt_fa_path,
-            "--overlayType",
-            "mask",
-            "--maskColour",
-            "1.0",
-            "0.0",
-            "0.0",
-            "--threshold",
-            "0.2",
-            "1",
-            "--outline",
-            "--outlineWidth",
-            "3",
-            "--volume",
-            "0",
-        ]
-        self._run_fsleyes(cmd)
-
-    # -------- main interface --------
-
     def _run_interface(self, runtime):
-        # --------------------------------
-        # Setup paths
-        # --------------------------------
-        dmri_root = self.inputs.dmri_root or ""
-        outdir = self.inputs.outdir or dmri_root or os.getcwd()
-        os.makedirs(outdir, exist_ok=True)
-
-        pdf_path = os.path.join(outdir, "CMC_invivo_QA.pdf")
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # --------------------------------
-        # Load core images and metadata
-        # --------------------------------
-        data_img = (
-            self._safe_load_img(self.inputs.data_4d)
-            if isdefined(self.inputs.data_4d)
-            else None
-        )
-        data_shape = None
-        voxel_size = None
-        n_vols = None
-
-        if data_img is not None:
-            data_shape = data_img.shape
-            if len(data_shape) >= 3:
-                n_vols = data_shape[3] if len(data_shape) == 4 else 1
-            voxel_size = data_img.header.get_zooms()[:3]
-
-        # Native mask and FA
-        native_mask_img = (
-            self._safe_load_img(self.inputs.mask_file)
-            if isdefined(self.inputs.mask_file)
-            else None
-        )
-        native_fa_img = (
-            self._safe_load_img(self.inputs.fa_img)
-            if isdefined(self.inputs.fa_img)
-            else None
-        )
-        v1_img = (
-            self._safe_load_img(self.inputs.v1_img)
-            if isdefined(self.inputs.v1_img)
-            else None
-        )
-
-        # Standard space mask and FA
-        std_mask_img = None
-        std_fa_img = None
-
-        if isdefined(self.inputs.nmt_mask_img):
-            std_mask_img = self._safe_load_img(self.inputs.nmt_mask_img)
-
-        if isdefined(self.inputs.nmt_fa_img):
-            std_fa_img = self._safe_load_img(self.inputs.nmt_fa_img)
-
-        # Subject FA in standard space
-        fa_std_path = None
-        if dmri_root:
-            fa_std_path = os.path.join(dmri_root, "stdreg", "FA_in_STD.nii.gz")
-            if not os.path.exists(fa_std_path):
-                fa_std_path = None
-
-        if std_fa_img is None and fa_std_path is not None:
-            std_fa_img = self._safe_load_img(fa_std_path)
-
-        if std_mask_img is None and std_fa_img is not None:
-            # As a fallback, use FA_in_STD as a mask
-            std_mask_img = std_fa_img
-
-        # Centres of gravity
-        native_cog_world = None
-        if native_mask_img is not None:
-            native_cog_world = self._world_cog_from_mask(native_mask_img)
-
-        std_cog_world = None
-        if std_mask_img is not None:
-            std_cog_world = self._world_cog_from_mask(std_mask_img)
-
-        # --------------------------------
-        # B-values and B-vectors
-        # --------------------------------
-        bvals_arr = None
-        bvecs_arr = None
-        unique_shells = []
-        n_b0 = None
-        n_dw = None
-
-        if (
-            isdefined(self.inputs.bvals)
-            and self.inputs.bvals
-            and os.path.exists(self.inputs.bvals)
-        ):
-            try:
-                bvals_arr = np.loadtxt(self.inputs.bvals)
-                bvals_arr = np.atleast_1d(bvals_arr)
-                n_b0 = int(np.sum(bvals_arr == 0))
-                n_total = bvals_arr.size
-                n_dw = int(n_total - n_b0)
-                nonzero = bvals_arr[bvals_arr > 0]
-                if nonzero.size > 0:
-                    unique_shells = sorted(
-                        np.unique(nonzero.astype(int)).tolist()
-                    )
-            except Exception:
-                bvals_arr = None
-
-        if (
-            isdefined(self.inputs.bvecs)
-            and self.inputs.bvecs
-            and os.path.exists(self.inputs.bvecs)
-        ):
-            try:
-                bvecs_arr = np.loadtxt(self.inputs.bvecs)
-                bvecs_arr = np.asarray(bvecs_arr)
-                if bvecs_arr.ndim == 2:
-                    if bvecs_arr.shape[0] == 3 and bvecs_arr.shape[1] != 3:
-                        bvecs_arr = bvecs_arr.T
-                    if bvecs_arr.shape[1] != 3:
-                        bvecs_arr = None
-                else:
-                    bvecs_arr = None
-            except Exception:
-                bvecs_arr = None
-
-        # --------------------------------
-        # Eddy QC JSON and images
-        # --------------------------------
-        eddy_qc = None
-        qc_cnr_avg = None
-        qc_cnr_std = None
-        b_shells = None
-        qc_dir = None
-
-        if isdefined(self.inputs.eddy_qc_json) and self.inputs.eddy_qc_json:
-            eddy_qc = self._safe_json(self.inputs.eddy_qc_json)
-            qc_dir = (
-                os.path.dirname(self.inputs.eddy_qc_json)
-                if os.path.exists(self.inputs.eddy_qc_json)
-                else None
-            )
-            if isinstance(eddy_qc, dict):
-                qc_cnr_avg = eddy_qc.get("qc_cnr_avg")
-                qc_cnr_std = eddy_qc.get("qc_cnr_std")
-                b_shells = eddy_qc.get("b_shells")
-
-        avg_pngs = []
-        cnr_pngs = []
-        if qc_dir and os.path.isdir(qc_dir):
-            for fname in sorted(os.listdir(qc_dir)):
-                if fname.startswith("avg_b") and fname.endswith(".png"):
-                    avg_pngs.append(os.path.join(qc_dir, fname))
-                if fname.startswith("cnr") and fname.endswith(".png"):
-                    cnr_pngs.append(os.path.join(qc_dir, fname))
-
-        # --------------------------------
-        # XTRACT PNGs
-        # --------------------------------
-        xtract_pngs = []
-        if isdefined(self.inputs.xtract_dir) and self.inputs.xtract_dir:
-            xdir = self.inputs.xtract_dir
-            if os.path.isdir(xdir):
-                for name in [
-                    "xtract_sagittal.png",
-                    "xtract_coronal.png",
-                    "xtract_axial.png",
-                ]:
-                    fpath = os.path.join(xdir, name)
-                    if os.path.exists(fpath):
-                        xtract_pngs.append(fpath)
-
-        # --------------------------------
-        # Nipype logs
-        # --------------------------------
-        nipype_dir_preproc = (
-            self.inputs.nipype_dir_preproc
-            if isdefined(self.inputs.nipype_dir_preproc)
-            else ""
-        )
-        nipype_dir_tract = (
-            self.inputs.nipype_dir_tract
-            if isdefined(self.inputs.nipype_dir_tract)
-            else ""
-        )
-
-        nipype_graph_preproc = None
-        nipype_graph_tract = None
-
-        if (
-            isdefined(self.inputs.nipype_graph_preproc)
-            and self.inputs.nipype_graph_preproc
-        ):
-            if os.path.exists(self.inputs.nipype_graph_preproc):
-                nipype_graph_preproc = self.inputs.nipype_graph_preproc
-
-        if (
-            isdefined(self.inputs.nipype_graph_tract)
-            and self.inputs.nipype_graph_tract
-        ):
-            if os.path.exists(self.inputs.nipype_graph_tract):
-                nipype_graph_tract = self.inputs.nipype_graph_tract
-
-        # --------------------------------
-        # Run mode description
-        # --------------------------------
-        mode = self.inputs.run_mode
-        if mode == "preproc_only":
-            mode_desc = "Preprocessing only (up to DTIFIT + registration)."
-        elif mode == "full":
-            mode_desc = "Preprocessing and tractography (XTRACT) run together."
-        else:
-            mode_desc = (
-                "Tract-only run using existing preprocessing outputs "
-                "(BedpostX and registration already present)."
-            )
-
-        # --------------------------------
-        # fsleyes visualisations (brain mask / DEC-FA / FA_in_STD+NMT)
-        # --------------------------------
-        brain_mask_png = os.path.join(outdir, "fa_mask_native.png")
-        dec_fa_png = os.path.join(outdir, "dec_fa_native.png")
-        nmt_reg_png = os.path.join(outdir, "fa_in_std_nmt_outline.png")
-
-        # Only run fsleyes if we have a sensible COG
-        if (
-            native_cog_world is not None
-            and np.all(np.isfinite(native_cog_world))
-        ):
-            if (
-                isdefined(self.inputs.fa_img)
-                and self.inputs.fa_img
-                and os.path.exists(self.inputs.fa_img)
-                and isdefined(self.inputs.mask_file)
-                and self.inputs.mask_file
-                and os.path.exists(self.inputs.mask_file)
-            ):
-                self._fsleyes_brain_mask(
-                    self.inputs.fa_img,
-                    self.inputs.mask_file,
-                    brain_mask_png,
-                    native_cog_world,
-                )
-
-            if (
-                isdefined(self.inputs.fa_img)
-                and self.inputs.fa_img
-                and os.path.exists(self.inputs.fa_img)
-                and isdefined(self.inputs.v1_img)
-                and self.inputs.v1_img
-                and os.path.exists(self.inputs.v1_img)
-            ):
-                self._fsleyes_color_fa(
-                    self.inputs.fa_img,
-                    self.inputs.v1_img,
-                    dec_fa_png,
-                    native_cog_world,
-                )
-
-        if (
-            std_cog_world is not None
-            and np.all(np.isfinite(std_cog_world))
-            and fa_std_path is not None
-            and os.path.exists(fa_std_path)
-            and isdefined(self.inputs.nmt_fa_img)
-            and self.inputs.nmt_fa_img
-            and os.path.exists(self.inputs.nmt_fa_img)
-        ):
-            self._fsleyes_nmt_reg(
-                fa_std_path,
-                self.inputs.nmt_fa_img,
-                nmt_reg_png,
-                std_cog_world,
-            )
-
-        # --------------------------------
-        # Build PDF pages
-        # --------------------------------
-        with PdfPages(pdf_path) as pdf:
-            # -------------------------
-            # Page 1: overview
-            # -------------------------
-            fig = plt.figure(figsize=(8.27, 11.69))  # A4-ish
-            fig.suptitle("CMC in-vivo dMRI QA report", fontsize=16, y=0.96)
-
-            text_lines = []
-
-            text_lines.append(
-                "This QA report was automatically generated by the CMC_invivo_pipeline "
-                f"on {timestamp}."
-            )
-            text_lines.append(
-                "Please cite Warrington et al. (in prep) and all relevant tools used within this pipeline."
-            )
-            text_lines.append("")
-            text_lines.append(f"Session root: {dmri_root if dmri_root else 'N/A'}")
-            text_lines.append(f"Run mode: {mode}")
-            text_lines.append(mode_desc)
-            text_lines.append("")
-
-            # Nipype dirs
-            text_lines.append("Nipype logging directories detected:")
-            if nipype_dir_preproc and os.path.isdir(nipype_dir_preproc):
-                text_lines.append(f"  - Preprocessing/full: {nipype_dir_preproc}")
-            else:
-                text_lines.append("  - Preprocessing/full: not found")
-
-            if nipype_dir_tract and os.path.isdir(nipype_dir_tract):
-                text_lines.append(f"  - Tract-only: {nipype_dir_tract}")
-            else:
-                text_lines.append("  - Tract-only: not found")
-
-            ax = fig.add_subplot(1, 1, 1)
-            ax.axis("off")
-            ax.text(
-                0.02,
-                0.98,
-                "\n".join(text_lines),
-                va="top",
-                ha="left",
-                fontsize=11,
-                wrap=True,
-            )
-
-            pdf.savefig(fig)
-            plt.close(fig)
-
-            # -------------------------
-            # Page 2: data properties, eddy metrics, bvals/bvecs
-            # -------------------------
-            fig = plt.figure(figsize=(8.27, 11.69))
-            gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1])
-            fig.suptitle(
-                "Page 2: Data properties and eddy QC metrics",
-                fontsize=14,
-                y=0.96,
-            )
-
-            # Text block: data properties and CNR summary
-            ax_info = fig.add_subplot(gs[0, :])
-            ax_info.axis("off")
-
-            info_lines = []
-
-            # Data properties
-            info_lines.append("Data properties:")
-            if data_shape is not None:
-                if len(data_shape) == 4:
-                    info_lines.append(
-                        f"  Dimensions: {data_shape[0]}, {data_shape[1]}, {data_shape[2]}"
-                    )
-                    info_lines.append(f"  Number of volumes: {data_shape[3]}")
-                else:
-                    info_lines.append(f"  Dimensions: {data_shape}")
-                if voxel_size is not None:
-                    info_lines.append(
-                        f"  Voxel size: {voxel_size[0]:.3f}, {voxel_size[1]:.3f}, {voxel_size[2]:.3f} (mm)"
-                    )
-            else:
-                info_lines.append("  Data image not found.")
-
-            # B-values summary
-            info_lines.append("")
-            info_lines.append("b-value summary (post-EDDY):")
-            if bvals_arr is not None:
-                if unique_shells:
-                    info_lines.append(
-                        f"  Unique non-zero b-values: {unique_shells}"
-                    )
-                else:
-                    info_lines.append("  No non-zero b-values detected.")
-                if n_b0 is not None and n_dw is not None:
-                    info_lines.append(f"  # b0 volumes: {n_b0}, # DW volumes: {n_dw}")
-            else:
-                info_lines.append("  bvals file not found or could not be parsed.")
-
-            # COGs
-            info_lines.append("")
-            info_lines.append("Brain centres (world coordinates):")
-            info_lines.append(
-                f"  Native-space brain COG: {self._fmt_coord(native_cog_world)}"
-            )
-            info_lines.append(
-                f"  Standard-space brain COG: {self._fmt_coord(std_cog_world)}"
-            )
-
-            # Eddy CNR summary
-            info_lines.append("")
-            info_lines.append("Eddy QC CNR summary (from qc.json):")
-            if qc_cnr_avg is not None and isinstance(qc_cnr_avg, (list, tuple)):
-                for idx, cnr_val in enumerate(qc_cnr_avg):
-                    bval = None
-                    if isinstance(b_shells, (list, tuple)) and len(b_shells) > idx:
-                        bval = b_shells[idx]
-
-                    if (
-                        qc_cnr_std is not None
-                        and isinstance(qc_cnr_std, (list, tuple))
-                        and len(qc_cnr_std) > idx
-                    ):
-                        std_val = qc_cnr_std[idx]
-                    else:
-                        std_val = None
-
-                    if bval == 0:
-                        label = "b=0 (tSNR)"
-                    elif bval is not None:
-                        label = f"b={bval}"
-                    else:
-                        label = f"shell {idx}"
-
-                    if std_val is not None:
-                        info_lines.append(
-                            f"  {label}: {cnr_val:.3f} (std = {std_val:.3f})"
-                        )
-                    else:
-                        info_lines.append(f"  {label}: {cnr_val:.3f}")
-            else:
-                info_lines.append("  CNR values not found in qc.json.")
-
-            ax_info.text(
-                0.02,
-                0.98,
-                "\n".join(info_lines),
-                va="top",
-                ha="left",
-                fontsize=10,
-                wrap=True,
-            )
-
-            # b-values plot
-            ax_bvals = fig.add_subplot(gs[1, :])
-            ax_bvals.plot(np.arange(bvals_arr.size), bvals_arr, ".-")
-            ax_bvals.set_xlabel("Volume index")
-            ax_bvals.set_ylabel("b-value")
-            ax_bvals.set_title("b-values per volume")
-
-            # b-vectors plot: one sphere per b-shell (including b=0)
-            # Unique shells including b=0
-            shells = np.unique(bvals_arr.astype(int))
-            shells = shells.tolist()
-            n_shells = len(shells)
-
-            # Sub-grid inside the third row: 1 row × n_shells columns
-            subgs = gs[2, :].subgridspec(1, n_shells)
-
-            for i, b in enumerate(shells):
-                ax_shell = fig.add_subplot(subgs[0, i], projection="3d")
-
-                # Select b-vectors for this shell
-                idx = (bvals_arr.astype(int) == b)
-                shell_bvecs = bvecs_arr[idx]
-
-                # Normalise to unit sphere, skipping zero vectors
-                if shell_bvecs.size > 0:
-                    norms = np.linalg.norm(shell_bvecs, axis=1)
-                    nonzero = norms > 0
-                    if np.any(nonzero):
-                        unit_vecs = shell_bvecs[nonzero] / norms[nonzero, None]
-                        ax_shell.scatter(
-                            unit_vecs[:, 0],
-                            unit_vecs[:, 1],
-                            unit_vecs[:, 2],
-                            s=10,
-                        )
-
-                # Draw a unit sphere wireframe
-                u = np.linspace(0, 2 * np.pi, 40)
-                v = np.linspace(0, np.pi, 40)
-                x = np.outer(np.cos(u), np.sin(v))
-                y = np.outer(np.sin(u), np.sin(v))
-                z = np.outer(np.ones_like(u), np.cos(v))
-                ax_shell.plot_wireframe(x, y, z, linewidth=0.3, alpha=0.3)
-
-                # Axis limits and labels
-                ax_shell.set_xlim([-1.1, 1.1])
-                ax_shell.set_ylim([-1.1, 1.1])
-                ax_shell.set_zlim([-1.1, 1.1])
-                ax_shell.set_xlabel("x")
-                ax_shell.set_ylabel("y")
-                ax_shell.set_zlabel("z")
-
-                # Title per shell
-                if b == 0:
-                    title = "b=0"
-                else:
-                    title = f"b={b}"
-                ax_shell.set_title(title, fontsize=9)
-
-                ax_shell.grid(False)
-                    
-            # -------------------------
-            # Page 3: eddy QC brain images
-            # -------------------------
-            fig = plt.figure(figsize=(8.27, 11.69))
-            fig.suptitle(
-                "Page 3: Eddy QC CNR brain visualisations",
-                fontsize=14,
-                y=0.96,
-            )
-
-            if avg_pngs and cnr_pngs and qc_cnr_avg is not None:
-                n_shells = min(len(avg_pngs), len(cnr_pngs), len(qc_cnr_avg))
-                # Include b_shells if present, otherwise label generically
-                if not isinstance(b_shells, (list, tuple)) or len(b_shells) < n_shells:
-                    b_shells_local = [None] * n_shells
-                else:
-                    b_shells_local = list(b_shells)[:n_shells]
-
-                gs_shells = fig.add_gridspec(n_shells, 2)
-
-                for idx in range(n_shells):
-                    avg_img = plt.imread(avg_pngs[idx])
-                    cnr_img = plt.imread(cnr_pngs[idx])
-                    cnr_val = qc_cnr_avg[idx]
-                    bval = b_shells_local[idx]
-
-                    if (
-                        qc_cnr_std is not None
-                        and isinstance(qc_cnr_std, (list, tuple))
-                        and len(qc_cnr_std) > idx
-                    ):
-                        std_val = qc_cnr_std[idx]
-                    else:
-                        std_val = None
-
-                    if bval == 0:
-                        shell_label = "b=0 (tSNR)"
-                        if std_val is not None:
-                            metric_label = (
-                                f"tSNR: {cnr_val:.3f} (std = {std_val:.3f})"
-                            )
-                        else:
-                            metric_label = f"tSNR: {cnr_val:.3f}"
-                    elif bval is not None:
-                        shell_label = f"b={bval}"
-                        if std_val is not None:
-                            metric_label = (
-                                f"CNR: {cnr_val:.3f} (std = {std_val:.3f})"
-                            )
-                        else:
-                            metric_label = f"CNR: {cnr_val:.3f}"
-                    else:
-                        shell_label = f"Shell {idx}"
-                        if std_val is not None:
-                            metric_label = (
-                                f"CNR: {cnr_val:.3f} (std = {std_val:.3f})"
-                            )
-                        else:
-                            metric_label = f"CNR: {cnr_val:.3f}"
-
-                    # Avg image (left)
-                    ax_avg = fig.add_subplot(gs_shells[idx, 0])
-                    ax_avg.imshow(avg_img)
-                    ax_avg.set_axis_off()
-                    ax_avg.set_title(
-                        f"{shell_label} average image\n{metric_label}",
-                        fontsize=10,
-                    )
-
-                    # CNR image (right)
-                    ax_cnr = fig.add_subplot(gs_shells[idx, 1])
-                    ax_cnr.imshow(cnr_img)
-                    ax_cnr.set_axis_off()
-                    if bval == 0:
-                        ax_cnr.set_title("tSNR map", fontsize=10)
-                    else:
-                        ax_cnr.set_title("CNR map", fontsize=10)
-            else:
-                ax = fig.add_subplot(1, 1, 1)
-                ax.set_axis_off()
-                ax.text(
-                    0.5,
-                    0.5,
-                    "Eddy QC PNGs or CNR metrics not found.\n"
-                    "Expected avg_b*.png and cnr*.png alongside qc.json.",
-                    ha="center",
-                    va="center",
-                )
-
-            pdf.savefig(fig)
-            plt.close(fig)
-
-            # -------------------------
-            # Page 4: brain masking, colour FA, FA in STD
-            # -------------------------
-            fig = plt.figure(figsize=(8.27, 11.69))
-            fig.suptitle(
-                "Page 4: Brain masks and FA visualisations",
-                fontsize=14,
-                y=0.96,
-            )
-            gs = fig.add_gridspec(1, 3)
-
-            # Panel 1: native FA with brain mask
-            ax1 = fig.add_subplot(gs[0, 0])
-            ax1.set_title("Native FA + brain mask", fontsize=10)
-            if os.path.exists(brain_mask_png):
-                img = plt.imread(brain_mask_png)
-                ax1.imshow(img)
-                ax1.axis("off")
-            else:
-                ax1.axis("off")
-                ax1.text(
-                    0.5,
-                    0.5,
-                    "Brain mask fsleyes PNG not available.",
-                    ha="center",
-                    va="center",
-                )
-
-            # Panel 2: DEC-FA (V1 colour coded)
-            ax2 = fig.add_subplot(gs[0, 1])
-            ax2.set_title("\nDirection-encoded colour FA (native)", fontsize=10)
-            if os.path.exists(dec_fa_png):
-                img = plt.imread(dec_fa_png)
-                ax2.imshow(img)
-                ax2.axis("off")
-            else:
-                ax2.axis("off")
-                ax2.text(
-                    0.5,
-                    0.5,
-                    "\nDirection-encoded FA fsleyes PNG not available.",
-                    ha="center",
-                    va="center",
-                )
-
-            # Panel 3: FA in standard space + NMT outline
-            ax3 = fig.add_subplot(gs[0, 2])
-            ax3.set_title("\nFA in STD with NMT outline", fontsize=10)
-            if os.path.exists(nmt_reg_png):
-                img = plt.imread(nmt_reg_png)
-                ax3.imshow(img)
-                ax3.axis("off")
-            else:
-                ax3.axis("off")
-                ax3.text(
-                    0.5,
-                    0.5,
-                    "\nSTD FA + NMT outline fsleyes PNG not available.",
-                    ha="center",
-                    va="center",
-                )
-
-            pdf.savefig(fig)
-            plt.close(fig)
-
-            # -------------------------
-            # Page 5: XTRACT summary PNGs
-            # -------------------------
-            fig = plt.figure(figsize=(8.27, 11.69))
-            fig.suptitle("Page 5: XTRACT summary", fontsize=14, y=0.96)
-
-            if xtract_pngs:
-                n_imgs = len(xtract_pngs)
-                gs = fig.add_gridspec(1, n_imgs)
-                for idx, png_path in enumerate(xtract_pngs):
-                    img = plt.imread(png_path)
-                    ax = fig.add_subplot(gs[0, idx])
-                    ax.imshow(img)
-                    ax.axis("off")
-                    ax.set_title(os.path.basename(png_path), fontsize=8)
-            else:
-                ax = fig.add_subplot(1, 1, 1)
-                ax.axis("off")
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No XTRACT summary PNGs found.",
-                    ha="center",
-                    va="center",
-                )
-
-            pdf.savefig(fig)
-            plt.close(fig)
-
-            # -------------------------
-            # Page 6: Nipype workflow graphs
-            # -------------------------
-            fig = plt.figure(figsize=(8.27, 11.69))
-            fig.suptitle(
-                "Page 6: Nipype workflow graphs",
-                fontsize=14,
-                y=0.96,
-            )
-
-            graphs_present = 0
-            if nipype_graph_preproc is not None:
-                graphs_present += 1
-            if nipype_graph_tract is not None:
-                graphs_present += 1
-
-            if graphs_present == 0:
-                ax = fig.add_subplot(1, 1, 1)
-                ax.axis("off")
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No Nipype workflow graphs found.",
-                    ha="center",
-                    va="center",
-                )
-            else:
-                if graphs_present == 1:
-                    gs = fig.add_gridspec(1, 1)
-                    if nipype_graph_preproc is not None:
-                        img = plt.imread(nipype_graph_preproc)
-                        ax = fig.add_subplot(gs[0, 0])
-                        ax.imshow(img)
-                        ax.axis("off")
-                        ax.set_title(
-                            "Preprocessing / full workflow graph",
-                            fontsize=10,
-                        )
-                    else:
-                        img = plt.imread(nipype_graph_tract)
-                        ax = fig.add_subplot(gs[0, 0])
-                        ax.imshow(img)
-                        ax.axis("off")
-                        ax.set_title(
-                            "Tract-only workflow graph",
-                            fontsize=10,
-                        )
-                else:
-                    gs = fig.add_gridspec(2, 1)
-                    # Preproc graph on top
-                    img1 = plt.imread(nipype_graph_preproc)
-                    ax1 = fig.add_subplot(gs[0, 0])
-                    ax1.imshow(img1)
-                    ax1.axis("off")
-                    ax1.set_title(
-                        "Preprocessing / full workflow graph",
-                        fontsize=10,
-                    )
-                    # Tract-only graph on bottom
-                    img2 = plt.imread(nipype_graph_tract)
-                    ax2 = fig.add_subplot(gs[1, 0])
-                    ax2.imshow(img2)
-                    ax2.axis("off")
-                    ax2.set_title(
-                        "Tract-only workflow graph",
-                        fontsize=10,
-                    )
-
-            pdf.savefig(fig)
-            plt.close(fig)
-
-            # (Optional) configuration note at the end of last page
-            if isdefined(self.inputs.pipeline_yaml) and self.inputs.pipeline_yaml:
-                fig = plt.figure(figsize=(8.27, 3.0))
-                fig.suptitle("Pipeline configuration", fontsize=12, y=0.9)
-                ax = fig.add_subplot(1, 1, 1)
-                ax.axis("off")
-                ax.text(
-                    0.02,
-                    0.8,
-                    "YAML configuration copied from:\n"
-                    f"{os.path.abspath(self.inputs.pipeline_yaml)}",
-                    va="top",
-                    ha="left",
-                    fontsize=9,
-                    wrap=True,
-                )
-                pdf.savefig(fig)
-                plt.close(fig)
-
-        self._report_pdf = pdf_path
+        def value(name):
+            item = getattr(self.inputs, name)
+            return str(item) if isdefined(item) and item else ""
+
+        root = Path(value("dmri_root") or ".").expanduser().resolve()
+        outdir = Path(value("outdir") or root / "QA").expanduser().resolve()
+        supplied = {name: value(name) for name in (
+            "pipeline_yaml", "eddy_qc_json", "nipype_dir_preproc", "nipype_dir_tract",
+            "nipype_graph_preproc", "nipype_graph_tract", "nmt_mask_img",
+            "nmt_fa_img", "data_4d", "bvals", "bvecs", "mask_file",
+            "fa_img", "v1_img", "xtract_dir")}
+        composer = _Composer(root, outdir, self.inputs.run_mode, supplied)
+        paths = composer.build()
+        self._results.update({key: str(path) for key, path in paths.items()})
         return runtime
 
-    def _list_outputs(self):
-        outputs = self._outputs().get()
-        outputs["report_pdf"] = getattr(self, "_report_pdf", None)
-        return outputs
+
+class _Composer:
+    def __init__(self, root, outdir, run_mode, supplied):
+        self.root = root
+        self.outdir = outdir
+        self.figures = outdir / "figures"
+        self.run_mode = run_mode
+        self.supplied = supplied
+        self.timestamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        self.sections = []
+        self.issues = []
+        self.sources = {}
+        self.config = {}
+        self.mode = "unknown"
+        self.raw_runs = {}
+        self.phase_runs = {}
+        self.steps = []
+
+    def issue(self, severity, title, detail):
+        self.issues.append({"severity": severity, "title": title, "detail": str(detail)})
+
+    def section(self, key, title, intro):
+        section = {"id": key, "title": title, "intro": intro, "figures": [], "notes": []}
+        self.sections.append(section)
+        return section
+
+    def figure(self, section, stem, title, caption, render, sources=()):
+        self.themed_figure(section, stem, title, caption, render, sources)
+
+    def themed_figure(self, section, stem, title, caption, render, sources=()):
+        names = {}
+        for theme in THEMES:
+            path = self.figures / f"{stem}_{theme}.png"
+            try:
+                render(path, theme)
+                if not path.is_file() or path.stat().st_size == 0:
+                    raise RuntimeError("rendering did not create a PNG")
+                names[theme] = path.name
+            except Exception as exc:
+                self.issue("warning", f"Could not render {title} ({theme})", exc)
+        if names:
+            section["figures"].append({"title": title, "caption": caption,
+                                       "light": names.get("light") or names.get("dark"),
+                                       "dark": names.get("dark") or names.get("light"),
+                                       "sources": [str(p) for p in sources if p]})
+        else:
+            section["notes"].append(f"{title} unavailable.")
+
+    def _source(self, key, *candidates):
+        for item in candidates:
+            if item and Path(item).is_file():
+                self.sources[key] = str(Path(item).resolve())
+                return Path(item)
+        return None
+
+    def _read_config(self):
+        path = self._source("config", self.supplied["pipeline_yaml"],
+                            self.root / "invivo_dmri_config.yaml")
+        if not path:
+            self.issue("warning", "Saved configuration unavailable",
+                       "Raw inputs and phase usage cannot be fully audited.")
+            return
+        try:
+            self.config = {str(k).lower(): v for k, v in
+                           (yaml.safe_load(path.read_text()) or {}).items()}
+            self.mode = str(self.config.get("mode", "unknown")).lower()
+        except Exception as exc:
+            self.issue("error", "Cannot read saved configuration", exc)
+
+    def _discover_raw(self):
+        config_path = self.sources.get("config")
+        mags = _image_paths(_configured_paths(self.config.get("mag_files", []), config_path))
+        phases = _image_paths(_configured_paths(self.config.get("phase_files", []), config_path))
+        if not mags:
+            candidate = Path(self.config.get("input_root") or self.root.parent)
+            for tag in ("AP", "PA", "LR", "RL"):
+                mags += _image_paths([candidate / tag])
+        self.raw_runs = {_run_key(p): p for p in mags if _run_key(p)}
+        self.phase_runs = {_run_key(p): p for p in phases if _run_key(p)}
+        self.sources["raw_magnitude_count"] = len(self.raw_runs)
+        self.sources["raw_phase_count"] = len(self.phase_runs)
+
+    def _phase_audit(self):
+        declared = _configured_paths(self.config.get("phase_files", []),
+                                     self.sources.get("config"))
+        denoise = bool(self.config.get("denoise", True))
+        if not declared:
+            self.issue("info", "No phase data declared",
+                       "The configuration does not request complex-valued denoising.")
+            return
+        missing_dirs = [str(p) for p in declared if not p.exists()]
+        if missing_dirs:
+            self.issue("error", "Configured phase paths not found", ", ".join(missing_dirs))
+        if denoise and not self.phase_runs:
+            self.issue("error", "Phase data declared but not discovered",
+                       "No matching phase NIfTI was found. Denoising may have run magnitude-only.")
+            return
+        for key, mag in self.raw_runs.items():
+            phase = self.phase_runs.get(key)
+            if denoise and phase is None:
+                self.issue("error", f"Missing phase for {mag.name}",
+                           "Expected a phase NIfTI with the same direction and run number.")
+            elif phase:
+                try:
+                    if nib.load(str(mag)).shape != nib.load(str(phase)).shape:
+                        self.issue("error", f"Magnitude/phase dimensions differ for {mag.name}",
+                                   f"{mag} versus {phase}")
+                except Exception as exc:
+                    self.issue("warning", f"Could not inspect phase pair {mag.name}", exc)
+        extras = sorted(set(self.phase_runs) - set(self.raw_runs))
+        if extras:
+            self.issue("warning", "Unpaired phase data", ", ".join(
+                self.phase_runs[key].name for key in extras))
+        if not denoise:
+            self.issue("info", "Denoising disabled", "Phase data were not expected to be used.")
+            return
+
+        commands = sorted((self.root / "nipype_logging").glob("*_dn/mapflow/*/command.txt"))
+        observed = {}
+        for path in commands:
+            try:
+                tokens = shlex.split(path.read_text().strip())
+                options = {tokens[i]: tokens[i + 1] for i in range(len(tokens) - 1)
+                           if tokens[i] in ("-magn", "-phase", "-domain")}
+                key = _run_key(options.get("-magn", ""))
+                if key:
+                    observed[key] = options
+            except Exception as exc:
+                self.issue("warning", "Could not read a denoising command", f"{path}: {exc}")
+        if not observed:
+            self.issue("warning", "Denoising domain not verified",
+                       "Nipype denoising command.txt files were unavailable; raw phase files alone "
+                       "do not prove they were used.")
+        for key, mag in self.raw_runs.items():
+            expected = self.phase_runs.get(key)
+            options = observed.get(key)
+            if options is None:
+                if expected and observed:
+                    self.issue("warning", f"Phase use not verified for {mag.name}",
+                               "No matching denoising command.txt was found for this run.")
+                continue
+            domain = options.get("-domain", "").lower()
+            used = Path(options.get("-phase", ""))
+            if expected and (domain != "complex" or used.resolve() != expected.resolve()):
+                self.issue("error", f"Phase not used for {mag.name}",
+                           f"Recorded domain={domain or 'unknown'}, phase={used}. "
+                           f"Expected complex with {expected}.")
+            elif not expected and domain == "complex":
+                self.issue("error", f"Unexpected phase pairing for {mag.name}",
+                           f"Pipeline used {used}, but no same-number phase file was found.")
+
+    def _step_status(self):
+        expected_xtract = self.run_mode in ("full", "tract_only")
+        checks = [
+            ("Raw", bool(self.raw_runs), True),
+            ("Denoising", bool(list(self.root.glob("*_denoised/*_1.nii.gz"))),
+             bool(self.config.get("denoise", True))),
+            ("Gibbs / N4", bool(list(self.root.glob("data_combined_gibbs_N4/*.nii.gz"))),
+             bool(self.config.get("run_gibbs", True) or self.config.get("run_n4", True))),
+            ("Drift", (self.root / "data_combined_drift" / "drift_plot.png").exists(), True),
+            ("TOPUP", (self.root / "topup" / "hifib0.nii.gz").exists(), True),
+            ("EDDY", (self.root / "eddy" / "eddy_unwarped_images.nii.gz").exists(), True),
+            ("DTIFIT", (self.root / "dtifit" / "dti_FA.nii.gz").exists(), True),
+            ("Registration", (self.root / "stdreg" / "FA_in_STD.nii.gz").exists(), True),
+            ("XTRACT", bool(list((self.root / "xtract" / "tracts").glob("*/densityNorm.nii.gz"))),
+             expected_xtract),
+        ]
+        self.steps = [{"name": name, "state": "complete" if present else
+                       "missing" if required else "not requested"}
+                      for name, present, required in checks]
+        for step in self.steps:
+            if step["state"] == "missing":
+                self.issue("warning", f"{step['name']} output not found",
+                           "This processing stage was expected for the selected run mode; "
+                           "its visual QA may be incomplete.")
+
+    def _audit_failures(self):
+        logdir = self.root / "nipype_logging"
+        if not logdir.is_dir():
+            return
+        crashes = sorted(p for p in logdir.rglob("crash-*") if p.is_file())
+        if crashes:
+            sample = ", ".join(str(p.relative_to(self.root)) for p in crashes[:4])
+            self.issue("warning", f"{len(crashes)} Nipype crash file(s) found",
+                       f"May include stale failures from a previous attempt: {sample}")
+
+    def build(self):
+        self.figures.mkdir(parents=True, exist_ok=True)
+        self._read_config()
+        self._discover_raw()
+        self._phase_audit()
+        self._step_status()
+        self._audit_failures()
+        self._denoising()
+        self._topup()
+        self._eddy()
+        self._mask()
+        self._diffusion_maps()
+        self._registration()
+        self._xtract()
+        paths = self._write_reports()
+        return paths
+
+    def _denoising(self):
+        section = self.section(
+            "denoising", "Before and after denoising",
+            "Matched raw and denoised magnitude data are shown for a representative "
+            "volume and a within-run shell average. Display scaling is shared across "
+            "each before/after pair; averaging is before motion correction.")
+        if not bool(self.config.get("denoise", True)):
+            section["notes"].append("Denoising was disabled in the saved configuration.")
+            return
+        if not self.raw_runs:
+            section["notes"].append("Raw magnitude runs could not be located from the saved configuration.")
+            return
+        tolerance = float(self.config.get("b0range", 60))
+        representatives = {}
+        tags = sorted({key[0] for key in self.raw_runs})
+        for tag in tags:
+            raw_for_tag = sorted(((key, path) for key, path in self.raw_runs.items()
+                                  if key[0] == tag), key=lambda item: item[0][1])
+            for ordinal, (key, raw) in enumerate(raw_for_tag, start=1):
+                den = self.root / f"{tag}_denoised" / f"{tag}_{ordinal}.nii.gz"
+                if not den.is_file():
+                    self.issue("warning", f"Denoised run unavailable for {raw.name}", den)
+                    continue
+                values = _bvals(_sidecar(raw, ".bval"))
+                if values is None:
+                    values = _bvals(_sidecar(den, ".bval"))
+                if values is None:
+                    self.issue("warning", f"B-values unavailable for {raw.name}",
+                               "Cannot select shell examples or averages.")
+                    continue
+                try:
+                    n_raw = nib.load(str(raw)).shape[3]
+                    n_den = nib.load(str(den)).shape[3]
+                    if n_raw != n_den or len(values) != n_raw:
+                        raise ValueError(f"raw={n_raw}, denoised={n_den}, bvals={len(values)}")
+                except Exception as exc:
+                    self.issue("error", f"Denoising dimensions mismatch for {raw.name}", exc)
+                    continue
+                for shell, indices in _shell_groups(values, tolerance).items():
+                    representatives.setdefault((tag, shell), (raw, den, indices, ordinal))
+        for (tag, shell), (raw, den, indices, ordinal) in sorted(representatives.items()):
+            label = f"{tag} run {ordinal}, b={shell}"
+            example = int(indices[len(indices) // 2])
+            prefix = f"denoise_{tag.lower()}_b{shell}"
+            self.figure(
+                section, prefix + "_example", label + " - example volume",
+                f"Volume {example} of {raw.name}. These panels show the same acquisition "
+                "before and after denoising; structured differences merit review.",
+                lambda path, theme, raw=raw, den=den, example=example, label=label:
+                    self._denoise_panel(raw, den, [example], label + " - example volume", path, theme),
+                (raw, den, _sidecar(raw, ".bval")))
+            self.figure(
+                section, prefix + "_average", label + " - shell average",
+                f"Mean of {len(indices)} volumes in this run and shell. This can reveal "
+                "persistent ghosting or spatially structured residual noise.",
+                lambda path, theme, raw=raw, den=den, indices=indices, label=label:
+                    self._denoise_panel(raw, den, indices, label + " - shell average", path, theme),
+                (raw, den, _sidecar(raw, ".bval")))
+        if not section["figures"]:
+            section["notes"].append("No complete raw/denoised run with usable b-values was found.")
+
+    @staticmethod
+    def _denoise_panel(raw, den, indices, title, path, theme):
+        if len(indices) == 1:
+            before = _volume(raw, indices[0])[0]
+            after = _volume(den, indices[0])[0]
+        else:
+            before = _mean_volume(raw, indices)
+            after = _mean_volume(den, indices)
+        if before.shape != after.shape:
+            raise ValueError(f"Different display grids: {before.shape} and {after.shape}")
+        _montage([("Raw", before), ("Denoised", after)], title, path,
+                 vmax=_scale((before, after)), theme=theme)
+
+    def _topup(self):
+        section = self.section(
+            "topup", "Susceptibility distortion correction",
+            "The opposite-PE b0 pair passed to TOPUP is compared with the HiFi b0 "
+            "written by applytopup. Assess geometric agreement and residual signal loss, "
+            "particularly near frontal and temporal regions.")
+        before = self._source("topup_input", self.root / "topup" / "Pos_Neg_b0.nii.gz")
+        after = self._source("topup_hifib0", self.root / "topup" / "hifib0.nii.gz")
+        if not before or not after:
+            section["notes"].append("Pos_Neg_b0 or hifib0 is missing; TOPUP visual comparison skipped.")
+            self.issue("warning", "TOPUP comparison incomplete",
+                       "Expected topup/Pos_Neg_b0.nii.gz and topup/hifib0.nii.gz.")
+            return
+
+        def render(path, theme):
+            input_img = nib.load(str(before))
+            rows = []
+            for index in range(min(2, input_img.shape[3] if len(input_img.shape) == 4 else 1)):
+                direction = "Positive PE" if index == 0 else "Negative PE"
+                rows.append((f"Before - {direction}", _volume(before, index)[0]))
+            corrected = nib.load(str(after))
+            corrected_data = (_mean_volume(after, range(corrected.shape[3]))
+                              if len(corrected.shape) == 4 else _volume(after)[0])
+            rows.append(("After - HiFi b0", corrected_data))
+            _montage(rows, "TOPUP: opposite-PE b0s and corrected HiFi b0", path,
+                     vmax=_scale([row[1] for row in rows]), theme=theme)
+
+        self.figure(section, "topup_pre_post", "TOPUP before / after",
+                    "First positive- and negative-PE b0 inputs, followed by the corrected "
+                    "HiFi b0. Differences between opposite-PE images are expected before "
+                    "correction; inspect whether anatomy becomes more consistent afterward.",
+                    render, (before, after))
+
+    def _eddy(self):
+        section = self.section(
+            "eddy", "EDDY and QUAD quality metrics",
+            "The b0 panel is voxelwise mean/std across b0s; diffusion CNR panels "
+            "summarise directional contrast relative to model residuals. Motion and "
+            "slice-outlier timecourses are aligned to the input-volume index. Run "
+            "transitions are marked separately from within-run motion.")
+        qc_path = self._source("eddy_qc_json", self.supplied["eddy_qc_json"],
+                               self.root / "eddy" / "eddy.qc" / "qc.json")
+        if not qc_path:
+            self.issue("warning", "EDDY QUAD QC missing", "eddy/eddy.qc/qc.json was not found.")
+            section["notes"].append("EDDY QUAD QC files were not found.")
+            return
+        try:
+            qc = json.loads(qc_path.read_text())
+        except Exception as exc:
+            self.issue("error", "Cannot parse EDDY QUAD QC", exc)
+            return
+        self.qc = qc
+        values = qc.get("qc_cnr_avg") or []
+        shells = qc.get("data_unique_bvals") or []
+        if values:
+            self.themed_figure(
+                section, "eddy_signal", "b0 SNR and shell CNR",
+                "QUAD b0 SNR (first panel) and CNR per nonzero shell. The b0 SNR "
+                "map can look speckled when few b0 repetitions make the voxelwise "
+                "standard-deviation estimate unstable; examine averaged b0s as well.",
+                lambda path, theme: self._eddy_signal_panel(qc, qc_path.parent, path, theme),
+                (qc_path,))
+        else:
+            section["notes"].append("QUAD SNR/CNR values were absent from qc.json.")
+        eddy_dir = self.root / "eddy"
+        motion = self._source("eddy_motion", eddy_dir / "eddy_unwarped_images.eddy_movement_rms")
+        outliers = self._source("eddy_outliers", eddy_dir / "eddy_unwarped_images.eddy_outlier_map")
+        bvals = self._source("eddy_bvals", eddy_dir / "Pos_Neg.bvals")
+        if motion and outliers and bvals:
+            self.themed_figure(
+                section, "eddy_motion_outliers", "Motion and slice outliers",
+                "Absolute RMS is relative to the first volume; relative RMS is "
+                "relative to the preceding volume. Transition peaks at an AP/PA "
+                "or run boundary should be distinguished from sustained within-run "
+                "movement. Outlier bars show slices flagged by EDDY.",
+                lambda path, theme: self._eddy_motion_panel(qc, eddy_dir, path, theme),
+                (motion, outliers, bvals, eddy_dir / "series.txt", eddy_dir / "index.txt"))
+        else:
+            section["notes"].append("Per-volume movement/outlier files were incomplete.")
+
+    @staticmethod
+    def _eddy_signal_panel(qc, qc_dir, output, theme):
+        values = qc.get("qc_cnr_avg") or []
+        shells = qc.get("data_unique_bvals") or []
+        if not values:
+            raise ValueError("qc_cnr_avg missing")
+        t = THEMES[theme]
+        labels = ["b0 SNR"] + [f"b={shell} CNR" for shell in shells]
+        rows = (len(values) + 1) // 2
+        with plt.rc_context(_figure_rc(theme)):
+            fig, axes = plt.subplots(rows, 2, figsize=(15, max(6, rows * 3.9)),
+                                     squeeze=False, layout="constrained")
+            fig.suptitle("EDDY QUAD - SNR and CNR", fontsize=19, weight="semibold")
+            for i, axis in enumerate(axes.flat):
+                axis.axis("off")
+                if i >= len(values):
+                    continue
+                title = labels[i] if i < len(labels) else f"shell {i}"
+                axis.set_title(f"{title}: {values[i]:.2f}", fontsize=15,
+                               weight="semibold", color=t["fg"])
+                png = qc_dir / f"cnr{i:04d}.nii.gz.png"
+                if png.is_file():
+                    axis.imshow(plt.imread(png), interpolation="nearest")
+                else:
+                    axis.text(0.5, 0.5, "Spatial map unavailable", ha="center",
+                              va="center", transform=axis.transAxes, color=t["fg"])
+            fig.savefig(output, dpi=175, facecolor=t["bg"])
+            plt.close(fig)
+
+    @staticmethod
+    def _eddy_motion_panel(qc, eddy_dir, output, theme):
+        prefix = eddy_dir / "eddy_unwarped_images"
+        motion = np.atleast_2d(np.loadtxt(str(prefix) + ".eddy_movement_rms"))
+        outliers = np.atleast_2d(np.loadtxt(str(prefix) + ".eddy_outlier_map", skiprows=1))
+        bvals = np.atleast_1d(np.loadtxt(eddy_dir / "Pos_Neg.bvals")).ravel()
+        n = len(motion)
+        if motion.shape[1] < 2 or outliers.shape[0] != n or len(bvals) != n:
+            raise ValueError("Motion, outlier map and bvals have inconsistent volume counts")
+        pe_path, series_path = eddy_dir / "index.txt", eddy_dir / "series.txt"
+        pe = (np.atleast_1d(np.loadtxt(pe_path, dtype=int)).ravel() if pe_path.is_file()
+              else np.ones(n, dtype=int))
+        series = (np.atleast_1d(np.loadtxt(series_path, dtype=int)).ravel()
+                  if series_path.is_file() else pe.copy())
+        if len(pe) != n or len(series) != n:
+            raise ValueError("index.txt or series.txt does not match EDDY volume count")
+        boundaries = [i for i in range(1, n)
+                      if series[i] != series[i - 1] or pe[i] != pe[i - 1]]
+        starts = [0] + boundaries
+        blocks = []
+        counts = defaultdict(int)
+        for start, end in zip(starts, starts[1:] + [n]):
+            code = int(pe[start])
+            counts[code] += 1
+            tag = {1: "AP", 2: "PA"}.get(code, f"PE {code}")
+            blocks.append((start, end, f"{tag} {counts[code]}"))
+        x = np.arange(n)
+        relative = motion[:, 1]
+        dropout = 100 * np.count_nonzero(outliers, axis=1) / outliers.shape[1]
+        boundary_near = np.array([any(abs(i - b) <= 1 for b in boundaries)
+                                  for i in range(n)])
+        high = relative >= 1.0
+        t = THEMES[theme]
+        with plt.rc_context(_figure_rc(theme)):
+            fig = plt.figure(figsize=(17, 10), layout="constrained")
+            grid = fig.add_gridspec(4, 2, width_ratios=[3.4, 1.3],
+                                    height_ratios=[1, 1, 1.1, 0.7])
+            axes = [fig.add_subplot(grid[i, 0]) for i in range(4)]
+            for axis in axes:
+                axis.grid(axis="y", color=t["grid"], linewidth=0.7)
+                axis.set_axisbelow(True)
+                axis.spines["top"].set_visible(False)
+                axis.spines["right"].set_visible(False)
+                for start, end, _ in blocks[1::2]:
+                    axis.axvspan(start - 0.5, end - 0.5, color=t["blue"], alpha=0.035)
+                for boundary in boundaries:
+                    changed = pe[boundary] != pe[boundary - 1]
+                    axis.axvline(boundary - 0.5, color=t["amber"] if changed else t["fg"],
+                                 linestyle=":" if changed else "--",
+                                 linewidth=1.6 if changed else 1, alpha=0.8)
+            axes[0].plot(x, motion[:, 0], color=t["blue"], linewidth=1.25)
+            axes[0].set_ylabel("Absolute RMS (mm)")
+            axes[0].set_ylim(top=max(1.0, float(np.max(motion[:, 0])) * 1.28))
+            axes[0].set_title("Head position and slice outliers across runs",
+                              fontsize=18, weight="semibold")
+            for start, end, label in blocks:
+                axes[0].text((start + end - 1) / 2, 0.98,
+                             f"{label}  ·  {start}-{end - 1}",
+                             transform=axes[0].get_xaxis_transform(), ha="center",
+                             va="top", fontsize=9, weight="semibold", color=t["fg"],
+                             bbox={"facecolor": t["bg"], "alpha": 0.88,
+                                   "edgecolor": "none", "pad": 2})
+            axes[1].plot(x, relative, color=t["blue"], linewidth=1.0)
+            axes[1].axhline(1.0, color=t["red"], linestyle=":", linewidth=0.9)
+            for select, color, marker, label in (
+                (high & ~boundary_near, t["red"], "o", "Away from boundary ≥1 mm"),
+                (high & boundary_near, t["amber"], "D", "At/near run boundary")):
+                if np.any(select):
+                    axes[1].scatter(x[select], relative[select], color=color,
+                                    marker=marker, s=30, zorder=4, label=label)
+            axes[1].set_ylabel("Relative RMS (mm)")
+            if np.any(high):
+                axes[1].legend(frameon=False, labelcolor=t["fg"], loc="upper right")
+            colors = [t["red"] if value >= 5 else t["amber"] if value > 0 else t["grid"]
+                      for value in dropout]
+            axes[2].bar(x, dropout, width=0.86, color=colors)
+            axes[2].axhline(5, color=t["red"], linestyle=":", linewidth=0.9)
+            axes[2].set_ylabel("Outlier slices (%)")
+            for index in np.argsort(dropout)[-5:]:
+                if dropout[index] > 0:
+                    axes[2].annotate(str(index), (index, dropout[index]),
+                                     xytext=(0, 4), textcoords="offset points",
+                                     ha="center", fontsize=8, color=t["fg"])
+            for code in sorted(set(pe)):
+                selected = pe == code
+                axes[3].scatter(x[selected], bvals[selected], s=9,
+                                color=t["blue"] if code == min(pe) else t["amber"],
+                                label={1: "AP", 2: "PA"}.get(int(code), f"PE {code}"))
+            axes[3].set_ylabel("b-value")
+            axes[3].set_xlabel("Volume (0-based)")
+            axes[3].legend(frameon=False, labelcolor=t["fg"], loc="upper right")
+            axes[3].set_xlim(-1, n)
+            summary_ax = fig.add_subplot(grid[:2, 1])
+            summary_ax.axis("off")
+            within = [float(relative[i]) for i in range(1, n) if i not in boundaries]
+            metrics = [
+                f"Mean abs RMS      {qc.get('qc_mot_abs', float('nan')):.2f} mm",
+                f"Mean rel RMS      {qc.get('qc_mot_rel', float('nan')):.2f} mm (all)",
+                f"Within-run rel    {np.mean(within):.2f} mm" if within else "Within-run rel    n/a",
+                f"Run starts        {', '.join(map(str, boundaries)) or 'none'}",
+                f"Boundary peaks    {int(np.sum(high & boundary_near))}",
+                f"Other ≥1 mm       {int(np.sum(high & ~boundary_near))}",
+                f"Outlier slices    {100 * qc.get('qc_outliers_tot', 0):.2f}%",
+                f"Volumes ≥5%      {int(np.sum(dropout >= 5))}",
+                f"repol / mporder   {qc.get('eddy_input', {}).get('repol', '?')} / "
+                f"{qc.get('eddy_input', {}).get('mporder', '?')}",
+            ]
+            summary_ax.set_title("At a glance", loc="left", fontsize=15, weight="semibold")
+            summary_ax.text(0, 0.95, "\n".join(metrics), va="top", fontsize=9,
+                            fontfamily="DejaVu Sans Mono", linespacing=1.55)
+            shell_ax = fig.add_subplot(grid[2:, 1])
+            shell_values = [float(v) for v in qc.get("data_unique_bvals", []) if float(v) > 0]
+            if not shell_values:
+                shell_values = sorted(set(int(round(v / 100) * 100)
+                                          for v in bvals if v > 60))
+            shell_pct = []
+            for shell in shell_values:
+                selected = (np.abs(bvals - shell) <= 60) & (bvals > 60)
+                shell_pct.append(float(np.mean(dropout[selected])) if np.any(selected) else 0)
+            shell_ax.barh(range(len(shell_values)), shell_pct, color=t["amber"])
+            shell_ax.set_yticks(range(len(shell_values)), [f"b={v:g}" for v in shell_values])
+            shell_ax.invert_yaxis()
+            shell_ax.set_title("Outlier burden by shell", loc="left", fontsize=13)
+            shell_ax.set_xlabel("Outlier slices (%)")
+            shell_ax.grid(axis="x", color=t["grid"], linewidth=0.7)
+            shell_ax.set_axisbelow(True)
+            fig.savefig(output, dpi=170, facecolor=t["bg"])
+            plt.close(fig)
+
+    def _mask(self):
+        section = self.section(
+            "mask", "Native-space brain masking",
+            "An EDDY-corrected b0 volume is shown with the final native-space "
+            "brain mask outlined in red. Check for excluded cortex/cerebellum and "
+            "included skull, eyes or residual ghosting.")
+        data_path = self._source("corrected_data", self.supplied["data_4d"],
+                                  self.root / "data" / "data.nii.gz")
+        mask_path = self._source("native_mask", self.supplied["mask_file"],
+                                  self.root / "data" / "nodif_brain_mask.nii.gz")
+        bvals_path = self._source("corrected_bvals", self.supplied["bvals"],
+                                   self.root / "data" / "bvals")
+        if not data_path or not mask_path:
+            self.issue("error", "Brain-mask QA unavailable",
+                       "Expected corrected data/data.nii.gz and data/nodif_brain_mask.nii.gz.")
+            section["notes"].append("Corrected data or native mask is missing.")
+            return
+
+        def render(path, theme):
+            values = _bvals(bvals_path)
+            b0range = float(self.config.get("b0range", 60))
+            selected = np.flatnonzero(values <= b0range) if values is not None else []
+            index = int(selected[0]) if len(selected) else 0
+            corrected_img = nib.load(str(data_path))
+            corrected = _volume(data_path, index)[0]
+            mask_img = _match_grid(nib.load(str(mask_path)), corrected_img, order=0)
+            mask = _canon(np.asarray(mask_img.dataobj), mask_img.affine)
+            if corrected.shape != mask.shape:
+                raise ValueError(f"Corrected data {corrected.shape} and mask {mask.shape} differ")
+            _montage([("Corrected b0 + mask", corrected)],
+                     f"Native-space mask on corrected b0 (volume {index})", path,
+                     vmax=_scale((corrected,)), masks=[mask], theme=theme)
+
+        self.figure(section, "native_mask_overlay", "Corrected b0 and final mask",
+                    "Red contour is the mask used for downstream diffusion modelling; "
+                    "the background is a distortion-corrected native-space b0.",
+                    render, (data_path, mask_path, bvals_path))
+
+    def _diffusion_maps(self):
+        section = self.section(
+            "tensor", "Diffusion tensor fit",
+            "FA and MD are fitted from the configured lower shell. Direction-encoded "
+            "V1 is shown with brightness modulated by FA, which helps expose "
+            "orientation discontinuities and registration or gradient errors.")
+        fa = self._source("fa_native", self.supplied["fa_img"],
+                          self.root / "dtifit" / "dti_FA.nii.gz")
+        md = self._source("md_native", self.root / "dtifit" / "dti_MD.nii.gz")
+        v1 = self._source("v1_native", self.supplied["v1_img"],
+                          self.root / "dtifit" / "dti_V1.nii.gz")
+        if not fa or not md or not v1:
+            self.issue("warning", "Tensor-map QA incomplete",
+                       "Expected dtifit/dti_FA.nii.gz, dti_MD.nii.gz and dti_V1.nii.gz.")
+            section["notes"].append("FA, MD or V1 was missing; tensor overview skipped.")
+            return
+
+        def render(path, theme):
+            fa_img = nib.load(str(fa))
+            md_img = _match_grid(nib.load(str(md)), fa_img)
+            v1_img = nib.load(str(v1))
+            if (v1_img.shape[:3] != fa_img.shape[:3]
+                    or not np.allclose(v1_img.affine, fa_img.affine)):
+                raise ValueError("V1 and FA are on different grids; vector resampling needs explicit reorientation")
+            fa_data = _canon(np.asarray(fa_img.dataobj), fa_img.affine)
+            md_data = _canon(np.asarray(md_img.dataobj), md_img.affine)
+            v1_data = _canon(np.asarray(v1_img.dataobj), v1_img.affine)
+            if v1_data.ndim != 4 or v1_data.shape[-1] < 3:
+                raise ValueError(f"Expected three-vector V1 image, got {v1_data.shape}")
+            rgb = np.clip(np.abs(v1_data[..., :3]) *
+                          np.clip(fa_data[..., None], 0, 1), 0, 1)
+            max_md = max(0.003, float(np.nanpercentile(md_data[np.isfinite(md_data)], 99)))
+            with plt.rc_context(_figure_rc(theme)):
+                fig, axes = plt.subplots(3, 3, figsize=(15, 10.5), layout="constrained")
+                fig.suptitle("DTIFIT: FA, MD and FA-modulated V1", fontsize=19,
+                             weight="semibold")
+                rows = [("FA", fa_data, "gray", 1.0),
+                        ("MD (mm²/s)", md_data, "magma", max_md),
+                        ("V1 × FA", rgb, None, None)]
+                for i, (label, data, cmap, maximum) in enumerate(rows):
+                    for j, plane in enumerate(_views(data)):
+                        axis = axes[i, j]
+                        axis.imshow(plane, cmap=cmap, vmin=0 if cmap else None,
+                                    vmax=maximum, interpolation="nearest")
+                        axis.set_title(("Sagittal", "Coronal", "Axial")[j] if i == 0 else "")
+                        axis.set_ylabel(label, fontsize=12, weight="semibold")
+                        axis.set_xticks([])
+                        axis.set_yticks([])
+                        for side in axis.spines.values():
+                            side.set_visible(False)
+                fig.savefig(path, dpi=170, facecolor=THEMES[theme]["bg"])
+                plt.close(fig)
+
+        self.figure(section, "tensor_maps", "FA, MD and V1×FA",
+                    "FA is displayed from 0 to 1; MD is in mm²/s with a common "
+                    "display scale across its three planes. V1 color encodes principal "
+                    "direction and FA modulates brightness.", render, (fa, md, v1))
+
+    def _registration(self):
+        section = self.section(
+            "registration", "Standard-space registration",
+            "The subject FA transformed to standard space is shown with a red "
+            "outline from standard-space white-matter FA (>0.2). The outline must "
+            "come from the template, not from the subject FA itself.")
+        transformed = self._source("fa_standard", self.root / "stdreg" / "FA_in_STD.nii.gz")
+        reference = self._source("fa_standard_template", self.supplied["nmt_fa_img"])
+        if not transformed or not reference:
+            self.issue("warning", "Registration overlay unavailable",
+                       "Subject FA_in_STD or the human/NHP standard-space FA reference is missing.")
+            section["notes"].append("Standard-space subject FA or reference FA was unavailable.")
+            return
+
+        def render(path, theme):
+            subject_img = nib.load(str(transformed))
+            template_img = _match_grid(nib.load(str(reference)), subject_img)
+            subject = _canon(np.asarray(subject_img.dataobj), subject_img.affine)
+            template = _canon(np.asarray(template_img.dataobj), template_img.affine)
+            if subject.shape != template.shape:
+                raise ValueError("Template FA could not be aligned to subject standard-space FA")
+            _montage([("Subject FA + WM outline", subject)],
+                     "Registration to standard space", path, vmax=0.8,
+                     masks=[template > 0.2], theme=theme)
+
+        self.figure(section, "standard_fa_overlay", "FA in standard space",
+                    "The red contour is template white matter (FA > 0.2). "
+                    "Inspect cortical, callosal and cerebellar alignment.",
+                    render, (transformed, reference))
+
+    def _xtract(self):
+        section = self.section(
+            "xtract", "XTRACT tractography overview",
+            "Standard-space tract-density visualisations show whether major "
+            "pathways are present and plausibly located. This is a spatial check, "
+            "not a quantitative tract-reliability score.")
+        xdir = Path(self.supplied["xtract_dir"] or self.root / "xtract")
+        tracts = sorted((xdir / "tracts").glob("*/densityNorm.nii.gz"))
+        self.sources["xtract_tract_count"] = len(tracts)
+        viewer = [xdir / name for name in ("xtract_sagittal.png", "xtract_coronal.png",
+                                           "xtract_axial.png")]
+        for view in viewer:
+            if not view.is_file():
+                continue
+            output = self.figures / view.name
+            try:
+                shutil.copy2(view, output)
+                section["figures"].append({
+                    "title": view.stem.replace("xtract_", "").title() + " tracts",
+                    "caption": "XTRACT viewer overlay of selected standard-space tracts.",
+                    "light": output.name, "dark": output.name,
+                    "sources": [str(view)]})
+            except Exception as exc:
+                self.issue("warning", f"Could not include {view.name}", exc)
+        if section["figures"]:
+            section["notes"].append(f"Found {len(tracts)} normalised tract-density files.")
+            return
+        if tracts:
+            section["notes"].append(
+                "Viewer PNGs were unavailable; a density-map overview was rendered instead.")
+            self.figure(section, "xtract_density_overview", "Major tract densities",
+                        "Maximum-intensity projections of representative tract densities "
+                        "in standard space. Colors distinguish tracts, not direction.",
+                        lambda path, theme: self._xtract_density_panel(tracts, path, theme),
+                        tracts[:8])
+        elif self.run_mode == "preproc_only":
+            section["notes"].append("XTRACT was not requested in this preprocessing-only run.")
+        else:
+            self.issue("warning", "XTRACT outputs unavailable",
+                       "No tract-density files or viewer PNGs were found.")
+            section["notes"].append("No XTRACT tract-density files or viewer PNGs were found.")
+
+    @staticmethod
+    def _xtract_density_panel(tracts, output, theme):
+        preferred = ("cst_l", "cst_r", "atr_l", "atr_r", "fma", "fmi", "fx_l", "fx_r")
+        selected = sorted(tracts, key=lambda p: (preferred.index(p.parent.name)
+                          if p.parent.name in preferred else 999, p.parent.name))[:8]
+        palette = np.array([[0.38, 0.65, 1], [1, 0.72, 0.25], [0.21, 0.82, 0.61],
+                            [0.97, 0.43, 0.48], [0.68, 0.55, 0.96], [0.99, 0.62, 0.35],
+                            [0.30, 0.79, 0.89], [0.93, 0.49, 0.80]])
+        reference = nib.load(str(selected[0]))
+        rgb = None
+        for i, path in enumerate(selected):
+            aligned = _match_grid(nib.load(str(path)), reference)
+            data = _canon(np.asarray(aligned.dataobj), aligned.affine)
+            nonzero = data[data > 0]
+            if nonzero.size == 0:
+                continue
+            level = float(np.percentile(nonzero, 99)) or 1.0
+            norm = np.clip(data / level, 0, 1)[..., None]
+            if rgb is None:
+                rgb = np.zeros(data.shape + (3,), dtype=np.float32)
+            rgb = np.maximum(rgb, norm * palette[i])
+        if rgb is None:
+            raise ValueError("All XTRACT tract-density maps were empty")
+        with plt.rc_context(_figure_rc(theme)):
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5.5), layout="constrained")
+            fig.suptitle("XTRACT: representative tract-density projections",
+                         fontsize=18, weight="semibold")
+            projections = (np.max(rgb, axis=0), np.max(rgb, axis=1), np.max(rgb, axis=2))
+            for axis, title, image in zip(axes, ("Sagittal", "Coronal", "Axial"), projections):
+                axis.imshow(np.rot90(image), interpolation="nearest")
+                axis.set_title(title)
+                axis.axis("off")
+            from matplotlib.patches import Patch
+            fig.legend([Patch(color=palette[i], label=path.parent.name)
+                        for i, path in enumerate(selected)],
+                       loc="lower center", ncol=4, frameon=False,
+                       labelcolor=THEMES[theme]["fg"])
+            fig.savefig(output, dpi=170, facecolor=THEMES[theme]["bg"])
+            plt.close(fig)
+
+    def _write_reports(self):
+        html_path = self.outdir / "CMC_invivo_QA.html"
+        pdf_light = self.outdir / "CMC_invivo_QA.pdf"
+        pdf_dark = self.outdir / "CMC_invivo_QA_dark.pdf"
+        manifest_path = self.outdir / "QA_manifest.json"
+        data_path = self.sources.get("corrected_data")
+        data_info = {}
+        if data_path:
+            try:
+                image = nib.load(data_path)
+                data_info = {"shape": list(image.shape),
+                             "voxel_size_mm": [round(float(v), 3)
+                                               for v in image.header.get_zooms()[:3]]}
+            except Exception as exc:
+                self.issue("warning", "Cannot read corrected-data header", exc)
+        config_summary = {key: self.config.get(key) for key in (
+            "mode", "lower_b", "b0range", "pifactor", "total_readout_time",
+            "denoise", "run_gibbs", "run_n4", "stdreg_method", "eddy_extra_args")
+            if key in self.config}
+        metadata = {
+            "generated": self.timestamp, "dmri_root": str(self.root),
+            "run_mode": self.run_mode, "species_mode": self.mode,
+            "config": config_summary, "data": data_info,
+        }
+        milestones = [self.root / "topup" / "hifib0.nii.gz",
+                      self.root / "eddy" / "eddy_unwarped_images.nii.gz",
+                      self.root / "dtifit" / "dti_FA.nii.gz",
+                      self.root / "stdreg" / "FA_in_STD.nii.gz"]
+        dates = [(p.name, dt.datetime.fromtimestamp(p.stat().st_mtime).astimezone())
+                 for p in milestones if p.is_file()]
+        metadata["output_timestamps"] = {key: value.isoformat(timespec="seconds")
+                                         for key, value in dates}
+        manifest = {"metadata": metadata, "issues": self.issues,
+                    "processing_steps": self.steps, "sources": self.sources,
+                    "sections": self.sections}
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+        html_path.write_text(self._html(metadata), encoding="utf-8")
+        for theme, path in (("light", pdf_light), ("dark", pdf_dark)):
+            try:
+                self._pdf(path, theme, metadata)
+            except Exception as exc:
+                self.issue("warning", f"Could not export {theme} PDF", exc)
+                if path.exists():
+                    path.unlink()
+        # Include any PDF-export warning in both portable metadata outputs.
+        manifest["issues"] = self.issues
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+        html_path.write_text(self._html(metadata), encoding="utf-8")
+        paths = {"report_html": html_path, "manifest_json": manifest_path,
+                 "figures_dir": self.figures}
+        if pdf_light.is_file():
+            paths["report_pdf"] = pdf_light
+        if pdf_dark.is_file():
+            paths["report_pdf_dark"] = pdf_dark
+        return paths
+
+    def _html(self, metadata):
+        esc = lambda item: html.escape(str(item), quote=True)
+        problems = sorted(self.issues, key=lambda item: {"error": 0, "warning": 1}.get(
+            item["severity"], 2))
+        if problems:
+            alert_cards = "".join(
+                f'<div class="alert {esc(item["severity"])}"><strong>{esc(item["title"])}</strong>'
+                f'<p>{esc(item["detail"])}</p></div>' for item in problems)
+        else:
+            alert_cards = '<div class="alert ok"><strong>No automated issues detected</strong>' \
+                          '<p>Visual inspection is still required.</p></div>'
+        step_cards = "".join(
+            f'<span class="step {esc(step["state"].replace(" ", "-"))}">'
+            f'{esc(step["name"])} <small>{esc(step["state"])}</small></span>'
+            for step in self.steps)
+        meta_items = [
+            ("Generated", metadata["generated"]), ("Mode", metadata["species_mode"].upper()),
+            ("Run", metadata["run_mode"].replace("_", " ")),
+            ("Latest output", max(metadata["output_timestamps"].values(), default="unavailable")),
+            ("Data", " × ".join(map(str, metadata["data"].get("shape", []))) or "unavailable"),
+            ("Voxel (mm)", " × ".join(map(str, metadata["data"].get("voxel_size_mm", [])))
+             or "unavailable"),
+        ]
+        stat_cards = "".join(f'<div class="stat"><span>{esc(key)}</span>'
+                             f'<strong>{esc(value)}</strong></div>' for key, value in meta_items)
+        config_rows = "".join(f"<tr><th>{esc(key)}</th><td>{esc(value)}</td></tr>"
+                              for key, value in metadata["config"].items())
+        date_rows = "".join(f"<tr><th>{esc(key)}</th><td>{esc(value)}</td></tr>"
+                            for key, value in metadata["output_timestamps"].items())
+        nav = "".join(f'<a href="#{esc(section["id"])}">{esc(section["title"])}</a>'
+                      for section in self.sections)
+        section_html = []
+        for section in self.sections:
+            cards = []
+            for figure in section["figures"]:
+                light = f'figures/{esc(figure["light"])}'
+                dark = f'figures/{esc(figure["dark"])}'
+                sources = "".join(f"<li>{esc(path)}</li>" for path in figure["sources"])
+                cards.append(
+                    f'<article class="figure"><h3>{esc(figure["title"])}</h3>'
+                    f'<img class="theme-light" src="{light}" alt="{esc(figure["title"])}">'
+                    f'<img class="theme-dark" src="{dark}" alt="{esc(figure["title"])}">'
+                    f'<p>{esc(figure["caption"])}</p>'
+                    + (f'<details><summary>Source files</summary><ul>{sources}</ul></details>'
+                       if sources else "") + '</article>')
+            notes = "".join(f'<p class="note">{esc(note)}</p>' for note in section["notes"])
+            section_html.append(
+                f'<section id="{esc(section["id"])}"><div class="section-head">'
+                f'<span class="eyebrow">VISUAL QA</span><h2>{esc(section["title"])}</h2>'
+                f'<p>{esc(section["intro"])}</p></div>{notes}'
+                f'<div class="figure-grid">{"".join(cards)}</div></section>')
+        return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CMC in-vivo dMRI QA · {esc(self.root.parent.name)}</title>
+<style>
+:root {{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; color-scheme: light dark; }}
+body {{ --bg:#f5f7fb; --paper:#ffffff; --text:#172033; --sub:#586579; --line:#dfe5ee;
+        --accent:#3274a1; --error:#c43d56; --warn:#9d620a; --good:#087e68;
+        margin:0; background:var(--bg); color:var(--text); line-height:1.48; }}
+body[data-theme="dark"] {{ --bg:#0b1320; --paper:#111827; --text:#f3f4f6; --sub:#aeb9c9;
+ --line:#324053; --accent:#60a5fa; --error:#fb7185; --warn:#fbbf24; --good:#34d399; }}
+* {{ box-sizing:border-box; }} a {{ color:var(--accent); }} .page {{ max-width:1480px; margin:auto; padding:0 28px 80px; }}
+header {{ border-bottom:1px solid var(--line); background:var(--paper); }}
+.top {{ max-width:1480px; margin:auto; padding:18px 28px; display:flex; align-items:center; gap:25px; }}
+.brand {{ font-size:14px; font-weight:800; letter-spacing:.16em; color:var(--accent); }}
+.top nav {{ display:flex; gap:15px; flex:1; overflow:auto; white-space:nowrap; font-size:12px; }}
+.top nav a {{ text-decoration:none; color:var(--sub); }} .top nav a:hover {{ color:var(--accent); }}
+button {{ border:1px solid var(--line); background:var(--bg); color:var(--text); padding:8px 13px;
+ border-radius:9px; cursor:pointer; font-weight:650; }}
+.hero {{ padding:58px 0 28px; }} .eyebrow {{ font-size:11px; letter-spacing:.18em; font-weight:800;
+ color:var(--accent); }} h1 {{ margin:8px 0; font-size:clamp(32px,4vw,54px); line-height:1.05; }}
+.subtitle {{ color:var(--sub); max-width:760px; font-size:17px; }}
+.stats {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin:28px 0; }}
+.stat, .figure, .alert, .config, .overview {{ background:var(--paper); border:1px solid var(--line);
+ border-radius:14px; }} .stat {{ padding:17px 20px; }} .stat span {{ color:var(--sub); display:block; font-size:12px; }}
+.stat strong {{ display:block; margin-top:5px; font-size:19px; }}
+section {{ padding-top:45px; }} .section-head {{ max-width:850px; margin-bottom:18px; }}
+h2 {{ font-size:28px; margin:6px 0 8px; }} .section-head p, .note {{ color:var(--sub); }}
+.alerts {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:10px; }}
+.alert {{ border-left:4px solid var(--accent); padding:16px 18px; }}
+.alert.error {{ border-left-color:var(--error); }} .alert.warning {{ border-left-color:var(--warn); }}
+.alert.ok {{ border-left-color:var(--good); }} .alert strong {{ display:block; }}
+.alert p {{ margin:7px 0 0; color:var(--sub); font-size:13px; overflow-wrap:anywhere; }}
+.overview, .config {{ padding:22px; }} .steps {{ display:flex; gap:8px; flex-wrap:wrap; }}
+.step {{ padding:9px 11px; border:1px solid var(--line); border-radius:9px; font-weight:650; }}
+.step small {{ display:block; color:var(--sub); font-weight:400; }}
+.step.complete {{ border-color:var(--good); }} .step.missing {{ border-color:var(--warn); }}
+.figure-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,590px),1fr)); gap:16px; }}
+.figure {{ padding:16px; overflow:hidden; }} .figure h3 {{ font-size:18px; margin:0 0 12px; }}
+.figure img {{ width:100%; height:auto; display:block; border-radius:7px; background:#111827; }}
+.figure p {{ color:var(--sub); font-size:14px; }} .figure details {{ color:var(--sub); font-size:12px; }}
+.figure li {{ overflow-wrap:anywhere; margin:4px 0; }} .note {{ background:var(--paper); border:1px dashed var(--line);
+ padding:14px 18px; border-radius:10px; }} .theme-dark {{ display:none!important; }}
+body[data-theme="dark"] .theme-dark {{ display:block!important; }}
+body[data-theme="dark"] .theme-light {{ display:none!important; }}
+table {{ border-collapse:collapse; width:100%; font-size:13px; }} th,td {{ padding:8px 10px;
+ border-bottom:1px solid var(--line); text-align:left; }} th {{ width:230px; color:var(--sub); }}
+footer {{ color:var(--sub); font-size:12px; padding:42px 0 0; }}
+@media print {{ header button, header nav {{ display:none; }} section {{ break-inside:avoid; }}
+ body {{ background:#fff; }} .page {{ max-width:none; }} }}
+</style></head><body data-theme="light"><header><div class="top"><span class="brand">CMC · DWI QA</span>
+<nav>{nav}</nav><button id="theme" type="button" aria-label="Toggle colour mode">Dark mode</button></div></header>
+<main class="page"><div class="hero"><span class="eyebrow">PROCESSING QUALITY ASSURANCE</span>
+<h1>{esc(self.root.parent.name)}</h1><p class="subtitle">A visual and quantitative audit of denoising,
+susceptibility correction, EDDY, tensor fitting, registration and tractography. Missing evidence is
+shown explicitly; a completed processing step is not a substitute for visual review.</p></div>
+<div class="stats">{stat_cards}</div>
+<section id="issues"><div class="section-head"><span class="eyebrow">CHECK FIRST</span>
+<h2>Action needed and caveats</h2><p>Configuration, phase pairing and missing output checks are listed before the image review.</p>
+</div><div class="alerts">{alert_cards}</div></section>
+<section id="processing"><div class="section-head"><span class="eyebrow">PIPELINE</span><h2>Processing overview</h2>
+<p>Status reflects files present when the report was generated. It does not imply scientific validity.</p></div>
+<div class="overview"><div class="steps">{step_cards}</div></div></section>
+{''.join(section_html)}
+<section id="configuration"><div class="section-head"><span class="eyebrow">PROVENANCE</span>
+<h2>Configuration and sources</h2></div><div class="config"><p><strong>Processing root:</strong> {esc(self.root)}</p>
+<p><strong>Saved configuration:</strong> {esc(self.sources.get('config', 'unavailable'))}</p>
+<p>File modification times for key outputs (provenance estimates, not execution durations):</p>
+<table>{date_rows}</table><h3>Selected parameters</h3><table>{config_rows}</table>
+<p>Full source paths, figure inventory and automated issues are in
+<a href="QA_manifest.json">QA_manifest.json</a>.</p></div></section>
+<footer>CMC in-vivo dMRI QA · generated {esc(self.timestamp)} · inspect all figures before accepting a dataset.</footer>
+</main><script>
+const body=document.body, button=document.getElementById('theme');
+let saved=null; try {{ saved=localStorage.getItem('cmc-qa-theme'); }} catch (_) {{}}
+if(saved==='dark' || (!saved && matchMedia('(prefers-color-scheme: dark)').matches)) body.dataset.theme='dark';
+function label(){{button.textContent=body.dataset.theme==='dark'?'Light mode':'Dark mode';}}
+button.onclick=()=>{{body.dataset.theme=body.dataset.theme==='dark'?'light':'dark';
+ try {{ localStorage.setItem('cmc-qa-theme',body.dataset.theme); }} catch (_) {{}} label();}};label();
+</script></body></html>'''
+
+    def _pdf(self, path, theme, metadata):
+        t = THEMES[theme]
+        with PdfPages(path) as pdf, plt.rc_context(_figure_rc(theme)):
+            fig = plt.figure(figsize=(13.33, 7.5), facecolor=t["bg"])
+            fig.text(0.055, 0.88, "CMC  /  IN-VIVO DWI", fontsize=13, weight="bold",
+                     color=t["blue"])
+            fig.text(0.055, 0.76, "Quality assurance", fontsize=32, weight="bold")
+            fig.text(0.055, 0.68, self.root.parent.name, fontsize=21)
+            details = [f"Generated: {self.timestamp}", f"Mode: {self.mode} / {self.run_mode}",
+                       f"Processing root: {self.root}"]
+            fig.text(0.055, 0.57, "\n".join(details), fontsize=10, linespacing=1.6)
+            alerts = sorted(self.issues, key=lambda i: {"error": 0, "warning": 1}.get(
+                i["severity"], 2))
+            fig.text(0.055, 0.43, "CHECK FIRST", fontsize=12, weight="bold", color=t["red"])
+            if alerts:
+                text = "\n".join(f"{item['severity'].upper()}: {item['title']}" for item in alerts[:7])
+                if len(alerts) > 7:
+                    text += f"\n... and {len(alerts) - 7} more (see HTML/manifest)"
+            else:
+                text = "No automated issues detected; visual inspection remains necessary."
+            fig.text(0.055, 0.38, text, fontsize=10, linespacing=1.55, va="top")
+            fig.text(0.95, 0.06, "CMC dMRI  ·  QA overview", ha="right", fontsize=9,
+                     color=t["fg"])
+            pdf.savefig(fig, facecolor=t["bg"])
+            plt.close(fig)
+            if len(alerts) > 7:
+                for start in range(0, len(alerts), 12):
+                    fig = plt.figure(figsize=(13.33, 7.5), facecolor=t["bg"])
+                    fig.text(0.05, 0.91, "Action needed and caveats", fontsize=22,
+                             weight="semibold")
+                    y = 0.82
+                    for item in alerts[start:start + 12]:
+                        color = t["red"] if item["severity"] == "error" else t["amber"]
+                        fig.text(0.055, y, item["severity"].upper() + "  " + item["title"],
+                                 fontsize=11, weight="bold", color=color)
+                        detail = textwrap.fill(item["detail"], width=135)
+                        fig.text(0.055, y - 0.032, detail, fontsize=8.5, color=t["fg"])
+                        y -= 0.075 + 0.022 * detail.count("\n")
+                    pdf.savefig(fig, facecolor=t["bg"])
+                    plt.close(fig)
+            for section in self.sections:
+                for item in section["figures"]:
+                    image_path = self.figures / item[theme]
+                    if not image_path.is_file():
+                        continue
+                    fig = plt.figure(figsize=(13.33, 7.5), facecolor=t["bg"])
+                    fig.text(0.055, 0.92, section["title"].upper(), fontsize=11,
+                             weight="bold", color=t["blue"])
+                    fig.text(0.055, 0.865, item["title"], fontsize=19, weight="semibold")
+                    axis = fig.add_axes((0.055, 0.17, 0.89, 0.65))
+                    axis.imshow(plt.imread(image_path))
+                    axis.axis("off")
+                    caption = textwrap.fill(item["caption"], width=155)
+                    fig.text(0.055, 0.12, caption, fontsize=9, va="top", color=t["fg"])
+                    fig.text(0.95, 0.035, f"{self.root.parent.name} · {theme} QA",
+                             ha="right", fontsize=8, color=t["fg"])
+                    pdf.savefig(fig, facecolor=t["bg"])
+                    plt.close(fig)

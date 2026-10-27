@@ -385,10 +385,6 @@ def build_workflow(
         )
 
         # Eddy QC from original preproc
-        qa.inputs.eddy_qc_json = os.path.join(
-            eddy_dir_root, "eddy.qc", "qc.json"
-        )
-
         qa.inputs.nmt_mask_img = (
             pkg_file("files", "NMT_v2.0_sym_05mm_LR_brainmask.nii.gz")
             if MODE == "nhp"
@@ -396,6 +392,7 @@ def build_workflow(
                 FSLDIR, "data", "standard", "MNI152_T1_1mm_brain_mask.nii.gz"
             )
         )
+        qa.inputs.nmt_fa_img = NMT_FA if MODE == "nhp" else HCP1065_FA_1MM
 
         # Core diffusion inputs
         qa.inputs.data_4d = data_4d
@@ -862,8 +859,8 @@ def build_workflow(
         dmri_root, "nipype_logging", "graph.png"
     )
 
-    # Eddy QC summary from EDDY
-    qa.inputs.eddy_qc_json = os.path.join(eddy_dir_root, "eddy.qc", "qc.json")
+    # Depend on completed QUAD rather than merely pointing at its future path.
+    wf.connect(eddy_qc, "qc_json", qa, "eddy_qc_json")
 
     # Standard-space mask / FA
     qa.inputs.nmt_mask_img = (
